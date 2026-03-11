@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Literal
+from typing import Optional, Tuple, Literal, Annotated
 import tyro
 from tyro.conf import (
     OmitArgPrefixes,
@@ -9,12 +9,10 @@ from tyro.conf import (
 )
 
 from data_loader.config import DataloaderSkipConfig
-from model.config import LossParams, ModelConfig
-from model.modules.features import FeatureConfig
+from model.config import NNUELightningConfig
 
-
-@dataclass
-class TrainingConfig(FeatureConfig):
+@dataclass(kw_only=True)
+class TrainingConfig:
     datasets: Positional[list[str]] = field(default_factory=list)
     """Training datasets (.binpack). Interleaved at chunk level if multiple specified. Same data is used for training and validation if no validation data is specified."""
 
@@ -39,17 +37,11 @@ class TrainingConfig(FeatureConfig):
     validation_datasets: UseAppendAction[Tuple[str, ...]] = ()
     """Validation data to use for validation instead of the training data."""
 
-    gamma: float = 0.992
-    """Multiplicative factor applied to the learning rate after every epoch."""
-
-    lr: float = 8.75e-4
-    """Initial learning rate."""
-
     num_workers: int = 1
     """Number of worker threads to use for data loading. Currently only works well for binpack."""
 
-    batch_size: int = -1
-    """Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128."""
+    batch_size_raw: Annotated[int, tyro.conf.arg(name="batch-size")] = 16384
+    """Number of positions per batch / per iteration. Default to 16384."""
 
     threads: int = -1
     """Number of torch threads to use. Default automatic (cores)."""
@@ -82,10 +74,19 @@ class TrainingConfig(FeatureConfig):
         default_factory=DataloaderSkipConfig
     )
 
-    model_config: OmitArgPrefixes[ModelConfig] = field(default_factory=ModelConfig)
+    nnue_lightning_config: OmitArgPrefixes[NNUELightningConfig] = field(
+        default_factory=NNUELightningConfig
+    )
 
-    loss_config: OmitArgPrefixes[LossParams] = field(default_factory=LossParams)
+    @property
+    def batch_size(self) -> int:
+        """Returns the validated batch size."""
+        return self.batch_size_raw if self.batch_size_raw > 0 else 16384
 
+    @property
+    def num_batches_per_epoch(self) -> int:
+        """Calculates batches per epoch based on validated batch size."""
+        return max(1, self.epoch_size // self.batch_size)
 
 if __name__ == "__main__":
     config = tyro.cli(TrainingConfig)

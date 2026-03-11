@@ -98,7 +98,6 @@ def make_data_loaders(
     )
     return train, val
 
-
 def main():
     args = tyro.cli(TrainingConfig)
     actual_threads, actual_workers = args.threads, args.num_workers
@@ -117,12 +116,11 @@ def main():
     if len(args.validation_datasets) > 0:
         val_datasets = args.validation_datasets
 
-    if (args.loss_config.start_lambda is not None) != (args.loss_config.end_lambda is not None):
+    loss_params = args.nnue_lightning_config.loss_params
+    if (loss_params.start_lambda is not None) != (loss_params.end_lambda is not None):
         raise Exception(
             "Either both or none of start_lambda and end_lambda must be specified."
         )
-
-    loss_params = args.loss_config
 
     loss_params.start_lambda = (
         loss_params.start_lambda
@@ -136,8 +134,6 @@ def main():
     )
 
     global_batch_size_requested = args.batch_size
-    if global_batch_size_requested <= 0:
-        global_batch_size_requested = 16384
     # temporarily default to using only device 0 if user didn't specify --gpus
     # doing this so that batch size is consistent since if we rely on "auto" behavior
     # we don't know at this point in the code what the world size is.
@@ -173,26 +169,18 @@ def main():
         flush=True,
     )
 
-    feature_name = args.features
+    feature_name = args.nnue_lightning_config.features
 
     print("Loss parameters:")
     print(loss_params)
 
-    num_batches_per_epoch=max(
-                1, args.epoch_size // global_batch_size_requested
-            )
-
     max_epoch = args.max_epochs or 800
     if args.resume_from_model is None:
         nnue = M.NNUE(
-            feature_name=feature_name,
-            loss_params=loss_params,
+            config=args.nnue_lightning_config,
             max_epoch=max_epoch,
-            num_batches_per_epoch=num_batches_per_epoch,
-            gamma=args.gamma,
-            lr=args.lr,
+            num_batches_per_epoch=args.num_batches_per_epoch,
             param_index=args.dataloader_config.param_index,
-            config=args.model_config,
             quantize_config=M.QuantizationConfig(),
         )
     else:
@@ -203,14 +191,12 @@ def main():
             raise RuntimeError(
                 f"Could not load checkpoint: {e}. The model to be resumed was probably saved with a different version of the code."
             )
-        nnue.loss_params = loss_params
-        nnue.max_epoch = max_epoch
-        nnue.num_batches_per_epoch = num_batches_per_epoch
         # we can set the following here just like that because when resuming
         # from .pt the optimizer is only created after the training is started
-        nnue.gamma = args.gamma
-        nnue.lr = args.lr
-        nnue.compile_backend = args.compile_backend
+        nnue.loss_params = loss_params
+        nnue.max_epoch = max_epoch
+        nnue.num_batches_per_epoch=args.num_batches_per_epoch
+        nnue.nnue_lightning_config = args.nnue_lightning_config
         nnue.param_index = args.dataloader_config.param_index
 
     input_feature_name = nnue.model.input_feature_name
@@ -242,7 +228,7 @@ def main():
     # see lightning/fabric/plugins/environments/slurm.py near line 110
     os.environ["SLURM_JOB_NAME"] = "bash"
 
-    refresh_rate = max(1, (nnue.num_batches_per_epoch + 4) // 5)
+    refresh_rate = max(1, (args.num_batches_per_epoch + 4) // 5)
     trainer = L.Trainer(
         default_root_dir=logdir,
         max_epochs=args.max_epochs,
