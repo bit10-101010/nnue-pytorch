@@ -13,29 +13,9 @@ L1 = 256
 L2 = 32
 L3 = 32
 
-QTensor = namedtuple('QTensor', ['tensor', 'scale'])
-def quantize_tensor(x, dtype=torch.int8, scale=127.0, min_max=None):
-  if min_max is not None:
-    q_x = x.clamp(min_max[0], min_max[1])
-  else:
-    q_x = x
-  q_x = (q_x * scale).round().to(dtype)
-  return QTensor(tensor=q_x, scale=scale)
-
-def dequantize_tensor(q_x):
-  return q_x.tensor.float() / q_x.scale
-
-class FakeQuantOp(torch.autograd.Function):
-  @staticmethod
-  def forward(ctx, x, dtype=torch.int8, scale=127.0, min_max=None):
-    x = quantize_tensor(x, dtype=dtype, scale=scale, min_max=min_max)
-    x = dequantize_tensor(x)
-    return x
-
-  @staticmethod
-  def backward(ctx, grad_output):
-    # straight through estimator
-    return grad_output, None, None, None
+POLICY_L1 = 256
+POLICY_L2 = 256
+POLICY = 64 * 64 # one-hot -> from x to (ignores underpromotions)
 
 class NNUE(pl.LightningModule):
   """
@@ -61,6 +41,11 @@ class NNUE(pl.LightningModule):
     self.l2 = nn.Linear(L2, L3)
     self.bn_l2 = nn.BatchNorm1d(num_features=L3)
     self.output = nn.Linear(L3, 1)
+
+    self.policy_l1 = nn.Linear(2 * L1, POLICY_L1)
+    self.policy_l2 = nn.Linear(POLICY_L1, POLICY_L2)
+    self.policy = nn.Linear(POLICY_L2, POLICY)
+
     self.lambda_ = lambda_
 
     self.swa_model = AveragedModel(self)
@@ -128,44 +113,19 @@ class NNUE(pl.LightningModule):
     b = self.input(b_in)
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
     # clamp here is used as a clipped relu to (0.0, 1.0)
-    l0_ = F.relu(l0_)
-    l1_ = F.relu(self.l1(l0_))
-    l2_ = F.relu(self.l2(l1_))
+    l0_clamp = torch.clamp(l0_, 0.0, 1.0)
+    l1_ = torch.clamp(self.l1(l0_clamp), 0.0, 1.0)
+    l2_ = torch.clamp(self.l2(l1_), 0.0, 1.0)
     x = self.output(l2_)
-    return x
+    # Policy head
+    p_l1 = F.relu(self.policy_l1(F.relu(l0_)))
+    p_l2 = F.relu(self.policy_l2(p_l1))
+    policy_ = self.policy(p_l2)
 
-  def quant_fc(self, layer, x, is_output=False):
-    l_w = layer.weight.data
-    l_b = layer.bias.data
-    if not is_output:
-      bias_scale = 8128
-    else:
-      bias_scale = 9600
-    layer.weight.data = FakeQuantOp.apply(l_w, torch.int8, bias_scale / 127.0, (-127.0 / 64.0, 127.0 / 64.0))
-    layer.bias.data = FakeQuantOp.apply(l_b, torch.int32, bias_scale)
-    result = layer(x)
-    layer.weight.data = l_w
-    layer.bias.data = l_b
-    return result
-
-  def quant_forward(self, us, them, w_in, b_in):
-    input_w = self.input.weight.data
-    input_b = self.input.bias.data
-    self.input.weight.data = FakeQuantOp.apply(input_w, torch.int16, 127.0)
-    self.input.bias.data = FakeQuantOp.apply(input_b, torch.int16, 127.0)
-    w = self.input(w_in)
-    b = self.input(b_in)
-    self.input.weight.data = input_w
-    self.input.bias.data = input_b
-
-    l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
-    l0_ = F.relu(l0_)
-    l1_ = F.relu(self.quant_fc(self.l1, l0_))
-    l2_ = F.relu(self.quant_fc(self.l2, l1_))
-    x = self.quant_fc(self.output, l2_, is_output=True)
-    return x
+    return x, policy_
 
   def step_(self, batch, batch_idx, loss_type):
+    us, them, white, black, outcome, score, move = batch
     us, them, white, black, outcome, score, ply = batch
 
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
@@ -173,6 +133,9 @@ class NNUE(pl.LightningModule):
     nnue2score = 600
     scaling = 361
 
+    q, moves = self(us, them, white, black)
+    q = q * nnue2score / scaling
+    t = outcome
     q = self(us, them, white, black) * nnue2score / scaling
     # Normalize ply to [0,1].
     ply = torch.clamp((ply - 40) / 100.0, 0.0, 1.0)
@@ -183,6 +146,15 @@ class NNUE(pl.LightningModule):
     epsilon = 1e-12
     teacher_entropy = -(p * (p + epsilon).log() + (1.0 - p) * (1.0 - p + epsilon).log())
     teacher_loss = -(p * F.logsigmoid(q) + (1.0 - p) * F.logsigmoid(-q))
+    outcome_loss = -(t * F.logsigmoid(q) + (1.0 - t) * F.logsigmoid(-q))
+    result  = self.lambda_ * teacher_loss    + (1.0 - self.lambda_) * outcome_loss
+    entropy = self.lambda_ * teacher_entropy + (1.0 - self.lambda_) * outcome_entropy
+    value_loss = result.mean() - entropy.mean()
+
+    policy_loss = F.cross_entropy(moves, move.long()) / 50
+    self.log(loss_type + '_value_loss', value_loss)
+    self.log(loss_type + '_policy_loss', policy_loss)
+    return value_loss + policy_loss
     result  = self.lambda_ * teacher_loss
     entropy = self.lambda_ * teacher_entropy
     loss = result.mean() - entropy.mean()
@@ -195,13 +167,13 @@ class NNUE(pl.LightningModule):
     # loss = F.mse_loss(output, score)
 
   def training_step(self, batch, batch_idx):
-    return self.step_(batch, batch_idx, 'train_loss')
+    return self.step_(batch, batch_idx, 'train')
 
   def validation_step(self, batch, batch_idx):
-    self.step_(batch, batch_idx, 'val_loss')
+    self.step_(batch, batch_idx, 'val')
 
   def test_step(self, batch, batch_idx):
-    self.step_(batch, batch_idx, 'test_loss')
+    self.step_(batch, batch_idx, 'test')
 
   def configure_optimizers(self):
     # Train with a lower LR on the output layer
