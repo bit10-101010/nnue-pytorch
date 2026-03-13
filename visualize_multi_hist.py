@@ -35,13 +35,15 @@ def is_safe_model_path(filename):
     return resolved_path
 
 def load_model(filename, feature_set):
-    if filename.endswith(".pt") or filename.endswith(".ckpt"):
-        # Validate and normalize the path before loading with torch.load,
-        # which internally uses pickle and can execute arbitrary code.
-        safe_filename = is_safe_model_path(filename)
+    # Validate and normalize the path before loading any model file.
+    # This ensures that all supported formats (.pt, .ckpt, .nnue) are
+    # constrained to a safe directory tree.
+    safe_filename = is_safe_model_path(filename)
+    if safe_filename.endswith(".pt") or safe_filename.endswith(".ckpt"):
+        # For .pt files, load only the tensor weights into a freshly
+        # constructed model rather than deserializing an arbitrary object
+        # graph.
         if safe_filename.endswith(".pt"):
-            # Load only the tensor weights into a freshly constructed model
-            # rather than deserializing an arbitrary object graph.
             state_dict = torch.load(safe_filename, map_location='cpu', weights_only=True)
             model = M.NNUE(feature_set=feature_set)
             model.load_state_dict(state_dict)
@@ -49,8 +51,8 @@ def load_model(filename, feature_set):
             model = M.NNUE.load_from_checkpoint(
                 safe_filename, feature_set=feature_set)
         model.eval()
-    elif filename.endswith(".nnue"):
-        with open(filename, 'rb') as f:
+    elif safe_filename.endswith(".nnue"):
+        with open(safe_filename, 'rb') as f:
             reader = NNUEReader(f, feature_set)
         model = reader.model
     else:
