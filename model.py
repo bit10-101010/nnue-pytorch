@@ -6,6 +6,9 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 # 3 layer fully connected network
 L1 = 256
 L2 = 32
@@ -37,6 +40,7 @@ class NNUE(pl.LightningModule):
     self.output = nn.Linear(L3, 1)
     self.lambda_ = lambda_
 
+    self.swa_model = AveragedModel(self)
     self._zero_virtual_feature_weights()
 
   '''
@@ -58,6 +62,8 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
+    self.swa_model = AveragedModel(self)
+
     if self.feature_set.name == new_feature_set.name:
       return
 
@@ -106,10 +112,15 @@ class NNUE(pl.LightningModule):
   def step_(self, batch, batch_idx, loss_type):
     us, them, white, black, outcome, score = batch
 
-    q = self(us, them, white, black)
+    # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
+    # This needs to match the value used in the serializer
+    nnue2score = 600
+    scaling = 361
+
+    q = self.swa_model(us, them, white, black) * nnue2score / scaling
     t = outcome
-    # Divide score by 600.0 to match the expected NNUE scaling factor
-    p = (score / 600.0).sigmoid()
+    p = (score / scaling).sigmoid()
+
     epsilon = 1e-12
     teacher_entropy = -(p * (p + epsilon).log() + (1.0 - p) * (1.0 - p + epsilon).log())
     outcome_entropy = -(t * (t + epsilon).log() + (1.0 - t) * (1.0 - t + epsilon).log())
@@ -136,5 +147,31 @@ class NNUE(pl.LightningModule):
     self.step_(batch, batch_idx, 'test_loss')
 
   def configure_optimizers(self):
-    optimizer = ranger.Ranger(self.parameters())
-    return optimizer
+    # Train with a lower LR on the output layer
+    LR = 1e-3
+    train_params = [
+      {'params': self.get_layers(lambda x: self.output != x), 'lr': LR},
+      {'params': self.get_layers(lambda x: self.output == x), 'lr': LR / 10},
+    ]
+    # increasing the eps leads to less saturated nets with a few dead neurons
+    optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
+    # Drop learning rate after 75 epochs
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
+    #1e-3 version_0
+    swa_scheduler = SWALR(optimizer, swa_lr=1e-4)
+    return [optimizer], [swa_scheduler]
+
+  def training_epoch_end(self, outputs):
+    self.swa_model.update_parameters(self)
+
+  def get_layers(self, filt):
+    """
+    Returns a list of layers.
+    filt: Return true to include the given layer.
+    """
+    for i in self.children():
+      if filt(i):
+        if isinstance(i, nn.Linear):
+          for p in i.parameters():
+            if p.requires_grad:
+              yield p
