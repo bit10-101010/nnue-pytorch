@@ -1,0 +1,27 @@
+name: Auto Resolve Conflicts
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Accept all current changes
+        run: |
+          git checkout --ours .
+          git add .
+          git commit -m "Auto resolved conflicts using ours" || echo "No conflicts"
+          git push
