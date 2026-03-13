@@ -1,6 +1,9 @@
 import argparse
-import features
-import math
+import hashlib
+import os
+
+import torch
+
 import model as M
 import numpy
 import nnue_bin_dataset
@@ -10,6 +13,27 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from functools import reduce
 import operator
+
+def fuse_bn(linear, bn):
+  w = linear.weight
+  mean = bn.running_mean
+  var_sqrt = torch.sqrt(bn.running_var + bn.eps)
+  beta = bn.weight
+  gamma = bn.bias
+  b = linear.bias
+  w = w * (beta / var_sqrt).reshape([linear.out_features, 1])
+  b = (b - mean) / var_sqrt * beta + gamma
+
+  fused_linear = torch.nn.Linear(linear.in_features, linear.out_features)
+  fused_linear.weight = torch.nn.Parameter(w)
+  fused_linear.bias = torch.nn.Parameter(b)
+  return fused_linear
+
+def fuse_bn_model(model):
+  model.input = fuse_bn(model.input, model.bn_input)
+  model.l1 = fuse_bn(model.l1, model.bn_l1)
+  model.l2 = fuse_bn(model.l2, model.bn_l2)
+  return model
 
 def ascii_hist(name, x, bins=6):
   N,X = numpy.histogram(x, bins=bins)
@@ -24,6 +48,7 @@ def ascii_hist(name, x, bins=6):
     print('{0}| {1}'.format(xi,bar))
 
 # hardcoded for now
+FC_HASH = 0x63337156
 VERSION = 0x7AF32F16
 
 class NNUEWriter():
@@ -32,9 +57,9 @@ class NNUEWriter():
   """
   def __init__(self, model):
     self.buf = bytearray()
+    model = fuse_bn_model(model)
 
-    fc_hash = self.fc_hash(model)
-    self.write_header(model, fc_hash)
+    self.write_header(model)
     self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
     self.write_feature_transformer(model)
     self.int32(fc_hash) # FC layers hash
@@ -62,9 +87,9 @@ class NNUEWriter():
       prev_hash = layer_hash
     return layer_hash
 
-  def write_header(self, model, fc_hash):
+  def write_header(self, model):
     self.int32(VERSION) # version
-    self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.int32(FC_HASH ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
     description = b"Features=HalfKP(Friend)[41024->256x2],"
     description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32]"
     description += b"(ClippedReLU[32](AffineTransform[32<-512](InputSlice[512(0:512)])))))"
@@ -119,37 +144,29 @@ class NNUEWriter():
     print("layer has {}/{} clipped weights. Exceeding by {} the maximum {}.".format(clipped, total_elements, clipped_max, kMaxWeight))
     #weight = weight.clamp(-kMaxWeight, kMaxWeight).mul(kWeightScale).round().to(torch.int8)
     ascii_hist('fc weight:', weight.numpy())
-    # FC inputs are padded to 32 elements for simd.
-    num_input = weight.shape[1]
-    if num_input % 32 != 0:
-      num_input += 32 - (num_input % 32)
-      new_w = torch.zeros(weight.shape[0], num_input, dtype=torch.int8)
-      new_w[:, :weight.shape[1]] = weight
-      weight = new_w
     # Stored as [outputs][inputs], so we can flatten
     self.buf.extend(weight.flatten().numpy().tobytes())
 
   def int32(self, v):
-    self.buf.extend(struct.pack("<I", v))
+    self.buf.extend(struct.pack("<i", v))
 
 class NNUEReader():
   def __init__(self, f, feature_set):
     self.f = f
     self.feature_set = feature_set
     self.model = M.NNUE(feature_set)
-    fc_hash = NNUEWriter.fc_hash(self.model)
 
-    self.read_header(feature_set, fc_hash)
+    self.read_header(feature_set)
     self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
     self.read_feature_transformer(self.model.input)
-    self.read_int32(fc_hash) # FC layers hash
+    self.read_int32(FC_HASH) # FC layers hash
     self.read_fc_layer(self.model.l1)
     self.read_fc_layer(self.model.l2)
     self.read_fc_layer(self.model.output, is_output=True)
 
-  def read_header(self, feature_set, fc_hash):
+  def read_header(self, feature_set):
     self.read_int32(VERSION) # version
-    self.read_int32(fc_hash ^ feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    self.read_int32(FC_HASH ^ feature_set.hash ^ (M.L1*2)) # halfkp network hash
     desc_len = self.read_int32() # Network definition
     description = self.f.read(desc_len)
 
@@ -175,44 +192,100 @@ class NNUEReader():
       kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
     kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
 
-    # FC inputs are padded to 32 elements for simd.
-    non_padded_shape = layer.weight.shape
-    padded_shape = (non_padded_shape[0], ((non_padded_shape[1]+31)//32)*32)
-
     layer.bias.data = self.tensor(numpy.int32, layer.bias.shape).divide(kBiasScale)
-    layer.weight.data = self.tensor(numpy.int8, padded_shape).divide(kWeightScale)
-
-    # Strip padding.
-    layer.weight.data = layer.weight.data[:non_padded_shape[0], :non_padded_shape[1]]
+    layer.weight.data = self.tensor(numpy.int8, layer.weight.shape).divide(kWeightScale)
 
   def read_int32(self, expected=None):
-    v = struct.unpack("<I", self.f.read(4))[0]
+    v = struct.unpack("<i", self.f.read(4))[0]
     if expected is not None and v != expected:
       raise Exception("Expected: %x, got %x" % (expected, v))
     return v
 
 def main():
-  parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
-  parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
-  parser.add_argument("target", help="Target file (can be .pt or .nnue)")
-  features.add_argparse_args(parser)
-  args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Converts files between ckpt and nnue format."
+    )
+    parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
+    parser.add_argument("target", help="Target file (can be .pt or .nnue)")
+    parser.add_argument(
+        "--out-sha",
+        action="store_true",
+        dest="out_sha",
+        help="Ignore target file name and save as nn-<sha>.nnue. If target is a directory, the file is placed there; otherwise it goes to dirname(target) or CWD.",
+    )
+    parser.add_argument(
+        "--description",
+        default=None,
+        type=str,
+        dest="description",
+        help="The description string to include in the network. Only works when serializing into a .nnue file.",
+    )
+    parser.add_argument(
+        "--ft_compression",
+        default="leb128",
+        type=str,
+        dest="ft_compression",
+        help="Compression method to use for FT weights and biases. Either 'none' or 'leb128'. Only allowed if saving to .nnue.",
+    )
+    parser.add_argument(
+        "--ft_perm",
+        default=None,
+        type=str,
+        dest="ft_perm",
+        help="Path to a file that defines the permutation to use on the feature transformer.",
+    )
+    parser.add_argument(
+        "--ft_optimize",
+        action="store_true",
+        dest="ft_optimize",
+        help="Whether to perform full feature transformer optimization (ftperm.py) on the resulting network. This process is very time consuming.",
+    )
+    parser.add_argument(
+        "--ft_optimize_data",
+        default=None,
+        type=str,
+        dest="ft_optimize_data",
+        help="Path to the dataset to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--ft_optimize_count",
+        default=10000,
+        type=int,
+        dest="ft_optimize_count",
+        help="Number of positions to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--no-cupy",
+        action="store_false",
+        dest="use_cupy",
+        help="Disable CUPY usage if not enough GPU memory is available. This will use numpy instead, which is slower.",
+    )
+    parser.add_argument(
+        "--device", type=int, default="0", help="Device to use for cupy"
+    )
 
-  feature_set = features.get_feature_set_from_name(args.features)
+    M.ModelConfig.add_model_args(parser)
+    M.add_feature_args(parser)
+    args = parser.parse_args()
 
-  print('Converting %s to %s' % (args.source, args.target))
+    feature_name = args.features
+
+    print("Converting %s to %s" % (args.source, args.target))
 
   if args.source.endswith(".pt") or args.source.endswith(".ckpt"):
-    if not args.target.endswith(".nnue"):
-      raise Exception("Target file must end with .nnue")
     if args.source.endswith(".pt"):
       nnue = torch.load(args.source)
     else:
       nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
     nnue.eval()
-    writer = NNUEWriter(nnue)
-    with open(args.target, 'wb') as f:
-      f.write(writer.buf)
+    if args.target.endswith(".nnue"):
+      writer = NNUEWriter(nnue)
+      with open(args.target, 'wb') as f:
+        f.write(writer.buf)
+    elif args.target.endswith(".pt"):
+      torch.save(nnue, args.target)
+    else:
+      raise Exception("Target file must end with .nnue or .pt")
   elif args.source.endswith(".nnue"):
     if not args.target.endswith(".pt"):
       raise Exception("Target file must end with .pt")
@@ -222,5 +295,5 @@ def main():
   else:
     raise Exception('Invalid filetypes: ' + str(args))
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    main()
