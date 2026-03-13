@@ -455,7 +455,10 @@ class NNUEVisualizer():
 def load_model(filename, feature_set):
     if filename.endswith(".pt") or filename.endswith(".ckpt"):
         if filename.endswith(".pt"):
-            model = torch.load(filename)
+            # Load only the state_dict and apply it to a freshly constructed model
+            state_dict = torch.load(filename, map_location="cpu")
+            model = M.NNUE(feature_set=feature_set)
+            model.load_state_dict(state_dict)
         else:
             model = M.NNUE.load_from_checkpoint(
                 filename, feature_set=feature_set)
