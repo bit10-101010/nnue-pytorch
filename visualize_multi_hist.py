@@ -8,17 +8,51 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 
 from serialize import NNUEReader
+import os
+
+def is_safe_model_path(filename):
+    """
+    Perform basic validation to ensure that the model file path is within
+    the current working directory tree and is not a symlink.
+    This is intended to reduce the risk of loading arbitrary files when
+    using torch.load (which relies on pickle and is unsafe for untrusted
+    input).
+    """
+    # Resolve the absolute, normalized path of the requested file.
+    resolved_path = os.path.realpath(filename)
+
+    # Define the base directory for allowed model files.
+    base_dir = os.path.realpath(os.getcwd())
+
+    # Ensure the resolved path is under the base directory.
+    if os.path.commonpath([resolved_path, base_dir]) != base_dir:
+        raise ValueError(f"Refusing to load model outside of base directory: {filename}")
+
+    # Disallow symlinked files explicitly, using the resolved safe path.
+    if os.path.islink(resolved_path):
+        raise ValueError(f"Refusing to load model from symlink: {filename}")
+
+    return resolved_path
 
 def load_model(filename, feature_set):
-    if filename.endswith(".pt") or filename.endswith(".ckpt"):
-        if filename.endswith(".pt"):
-            model = torch.load(filename)
+    # Validate and normalize the path before loading any model file.
+    # This ensures that all supported formats (.pt, .ckpt, .nnue) are
+    # constrained to a safe directory tree.
+    safe_filename = is_safe_model_path(filename)
+    if safe_filename.endswith(".pt") or safe_filename.endswith(".ckpt"):
+        # For .pt files, load only the tensor weights into a freshly
+        # constructed model rather than deserializing an arbitrary object
+        # graph.
+        if safe_filename.endswith(".pt"):
+            state_dict = torch.load(safe_filename, map_location='cpu', weights_only=True)
+            model = M.NNUE(feature_set=feature_set)
+            model.load_state_dict(state_dict)
         else:
             model = M.NNUE.load_from_checkpoint(
-                filename, feature_set=feature_set)
+                safe_filename, feature_set=feature_set)
         model.eval()
-    elif filename.endswith(".nnue"):
-        with open(filename, 'rb') as f:
+    elif safe_filename.endswith(".nnue"):
+        with open(safe_filename, 'rb') as f:
             reader = NNUEReader(f, feature_set)
         model = reader.model
     else:
