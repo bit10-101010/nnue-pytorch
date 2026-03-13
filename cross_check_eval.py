@@ -1,27 +1,12 @@
 import argparse
 import subprocess
 import re
+from model import NNUE
+import torch
 
-import chess
-
-import data_loader
-from model import (
-    add_feature_args,
-    NNUE,
-    NNUEReader,
-    ModelConfig,
-    QuantizationConfig,
-)
-
-
-def read_model(
-    nnue_path,
-    feature_name: str,
-    config: ModelConfig,
-    quantize_config: QuantizationConfig,
-):
-    with open(nnue_path, "rb") as f:
-        reader = NNUEReader(f, feature_name, config, quantize_config)
+def read_model(nnue_path, feature_set):
+    with open(nnue_path, 'rb') as f:
+        reader = serialize.NNUEReader(f, feature_set)
         return reader.model
 
 
@@ -105,31 +90,10 @@ def compute_correlation(engine_evals, model_evals):
         )
     )
 
-    relative_model_error = sum(
-        abs(model - engine) / (abs(engine) + 0.001)
-        for model, engine in zip(model_evals, engine_evals)
-    ) / len(engine_evals)
-    relative_engine_error = sum(
-        abs(model - engine) / (abs(model) + 0.001)
-        for model, engine in zip(model_evals, engine_evals)
-    ) / len(engine_evals)
-    min_diff = min(
-        abs(model - engine) for model, engine in zip(model_evals, engine_evals)
-    )
-    max_diff = max(
-        abs(model - engine) for model, engine in zip(model_evals, engine_evals)
-    )
-    print("Relative engine error: {}".format(relative_engine_error))
-    print("Relative model error: {}".format(relative_model_error))
-    print(
-        "Avg abs difference: {}".format(
-            sum(abs(model - engine) for model, engine in zip(model_evals, engine_evals))
-            / len(engine_evals)
-        )
-    )
-    print("Min difference: {}".format(min_diff))
-    print("Max difference: {}".format(max_diff))
-
+    errors = ((abs(model - engine), max(abs(model), abs(engine))) for model, engine in zip(model_evals, engine_evals))
+    relative_error = sum(map(lambda x: 0.0 if x[1] == 0 else x[0] / x[1], errors)) / len(engine_evals)
+    print('Relative error: {}'.format(relative_error))
+    print('Avg abs difference: {}'.format(sum(abs(model - engine) for model, engine in zip(model_evals, engine_evals)) / len(engine_evals)))
 
 def eval_engine_batch(engine_path, net_path, fens):
     engine = subprocess.Popen(
@@ -163,31 +127,20 @@ def main():
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("--net", type=str, help="path to a .nnue net")
     parser.add_argument("--engine", type=str, help="path to stockfish")
-    parser.add_argument("--data", type=str, help="path to a .bin or .binpack dataset")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        help="Optional checkpoint (used instead of nnue for local eval)",
-    )
-    parser.add_argument(
-        "--count", type=int, default=100, help="number of datapoints to process"
-    )
-
-    ModelConfig.add_model_args(parser)
-
-    add_feature_args(parser)
+    parser.add_argument("--data", type=str, help="path to .bin dataset")
+    parser.add_argument("--checkpoint", type=str, help="Optional checkpoint (used instead of nnue for local eval)")
+    parser.add_argument("--jitpt", type=str, help="Optional torch.jit .pt model (used instead of nnue for local eval)")
+    parser.add_argument("--count", type=int, default=100, help="number of datapoints to process")
+    features.add_argparse_args(parser)
     args = parser.parse_args()
 
     batch_size = 1000
 
     feature_name = args.features
     if args.checkpoint:
-        model = NNUE.load_from_checkpoint(
-            args.checkpoint,
-            feature_name=feature_name,
-            config=ModelConfig.get_model_config(args),
-            quantize_config=QuantizationConfig(),
-        )
+      model = NNUE.load_from_checkpoint(args.checkpoint, feature_set=feature_set)
+    elif args.jitpt:
+      model = torch.jit.load(args.jitpt)
     else:
         model = read_model(
             args.net,

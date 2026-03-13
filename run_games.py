@@ -76,29 +76,13 @@ def convert_ckpt(root_dir, features):
     # lets move the .nnue files a bit up in the tree, and get rid of the = sign.
     # run96/run0/default/version_0/checkpoints/epoch=3.ckpt -> run96/run0/nn-epoch3.nnue
     for ckpt in ckpts:
-        nnue_file_name = re.sub(
-            "default[/\\\\]version_[0-9]+[/\\\\]checkpoints[/\\\\]", "", ckpt
-        )  # for older pytorch lightning
-        nnue_file_name = re.sub(
-            "lightning_logs[/\\\\]version_[0-9]+[/\\\\]checkpoints[/\\\\]",
-            "",
-            nnue_file_name,
-        )  # for newer pytorch lightning
-        nnue_file_name = re.sub(
-            r"epoch\=([0-9]+).*\.ckpt", r"nn-epoch\1.nnue", nnue_file_name
-        )
-        if not os.path.exists(nnue_file_name) and os.path.exists(ckpt):
-            with subprocess.Popen(
-                [
-                    sys.executable,
-                    "serialize.py",
-                    ckpt,
-                    nnue_file_name,
-                    f"--features={features}",
-                ]
-            ) as process:
-                if process.wait():
-                    print_atomic("Error serializing!")
+        nnue_file_name = re.sub("default/version_[0-9]+/checkpoints/", "", ckpt)
+        nnue_file_name = re.sub(r"epoch\=([0-9]+).*\.ckpt", r"nn-epoch\1.nnue", nnue_file_name)
+        if not os.path.exists(nnue_file_name):
+            command = "{} quantize.py {} {} {}".format(sys.executable, ckpt, nnue_file_name, 'large_gensfen_multipvdiff_100_d9.bin')
+            ret = os.system(command)
+            if ret != 0:
+                print("Error serializing!")
 
 
 def find_nnue(root_dir):
@@ -142,36 +126,17 @@ def run_match(
 ):
     """Run a match using c-chess-cli adding pgns to a file to be analysed with ordo"""
 
-    pgn_file_name = os.path.join(root_dir, "out_temp.pgn")
-    command = []
-    if sys.platform != "win32":
-        command += ["stdbuf", "-o0"]
-    command += [
-        c_chess_exe,
-        "-gauntlet",
-        "-rounds",
-        "1",
-        "-concurrency",
-        f"{concurrency}",
-    ]
-    command += game_params.get_all_params()
-    command += [
-        "-openings",
-        f"file={book_file_name}",
-        "order=random",
-        f"srand={random.randint(0, 100000000)}",
-        "-repeat",
-        "-resign",
-        "count=3",
-        "score=700",
-        "-draw",
-        "count=8",
-        "score=10",
-        "-pgn",
-        f"{pgn_file_name}",
-        "0",
-    ]
-    command += ["-engine", f"cmd={stockfish_base}", "name=master"]
+    pgn_file_name = os.path.join(root_dir, "out.pgn")
+    command = "{} -each tc=4+0.04 option.Hash=8 option.Threads=1 -gauntlet -games 75 -rounds 1 -concurrency {}".format(
+        c_chess_exe, concurrency
+    )
+    command = (
+        command
+        + " -openings file={} order=random -repeat -resign 3 700 -draw 8 10".format(
+            book_file_name
+        )
+    )
+    command = command + " -engine cmd={} name=master".format(stockfish_base)
     for net in best:
         evalfile = os.path.join(os.getcwd(), net)
         netname = PurePath(*PurePath(evalfile).parts[-2:])

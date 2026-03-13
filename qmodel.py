@@ -1,13 +1,11 @@
 import chess
-import math
 import ranger
 import torch
 from torch import nn
+from torch.quantization import QuantStub, DeQuantStub
+from torch.nn.quantized import FloatFunctional
 import torch.nn.functional as F
 import pytorch_lightning as pl
-
-from torch.optim.swa_utils import AveragedModel, SWALR
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # 3 layer fully connected network
 L1 = 256
@@ -16,31 +14,31 @@ L3 = 32
 
 class NNUE(pl.LightningModule):
   """
-  This model attempts to directly represent the nodchip Stockfish trainer methodology.
+  This model implementation is designed to be quantized using the built-in
+  Pytorch quantization framework.  This leads to some different design decisions
+  which is why it's a separate implementation.
 
   lambda_ = 0.0 - purely based on game results
   lambda_ = 1.0 - purely based on search scores
   """
   def __init__(self, feature_set, lambda_=1.0):
     super(NNUE, self).__init__()
-    self.input = nn.Linear(feature_set.num_features, L1)
-    weights = self.input.weight.clone()
-    kMaxActiveDimensions = 32
-    kSigma = 0.1 / math.sqrt(kMaxActiveDimensions)
-    weights = weights.normal_(0.0, kSigma)
-    biases = self.input.bias
-    biases = biases.clone().fill_(0.5)
-    self.input.weight = nn.Parameter(weights)
-    self.input.bias = nn.Parameter(biases)
     self.feature_set = feature_set
-    self.l1 = nn.Linear(2 * L1, L2)
-    self.bn_l1 = nn.BatchNorm1d(num_features=L2)
-    self.l2 = nn.Linear(L2, L3)
-    self.bn_l2 = nn.BatchNorm1d(num_features=L3)
-    self.output = nn.Linear(L3, 1)
     self.lambda_ = lambda_
+    self.input = nn.Linear(feature_set.num_features, L1)
+    self.input_act = nn.ReLU()
+    self.l1 = nn.Linear(2 * L1, L2)
+    self.l1_act = nn.ReLU()
+    self.l2 = nn.Linear(L2, L3)
+    self.l2_act = nn.ReLU()
+    self.l3 = nn.Linear(L2, L3)
+    self.l3_act = nn.ReLU()
+    self.output = nn.Linear(L3, 1)
+    self.quant = QuantStub()
+    self.dequant = DeQuantStub()
+    self.input_mul = FloatFunctional()
+    self.input_add = FloatFunctional()
 
-    self.swa_model = AveragedModel(self)
     self._zero_virtual_feature_weights()
 
   '''
@@ -54,7 +52,7 @@ class NNUE(pl.LightningModule):
   def _zero_virtual_feature_weights(self):
     weights = self.input.weight
     for a, b in self.feature_set.get_virtual_feature_ranges():
-      weights[a:b, :] = 0.0
+      weights[:, a:b] = 0.0
     self.input.weight = nn.Parameter(weights)
 
   '''
@@ -62,8 +60,6 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
-    self.swa_model = AveragedModel(self)
-
     if self.feature_set.name == new_feature_set.name:
       return
 
@@ -99,14 +95,20 @@ class NNUE(pl.LightningModule):
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
   def forward(self, us, them, w_in, b_in):
-    w = self.bn_input(self.input(w_in))
-    b = self.bn_input(self.input(b_in))
-    l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
-    # clamp here is used as a clipped relu to (0.0, 1.0)
-    l0_ = F.relu(l0_)
-    l1_ = F.relu(self.l1(l0_))
-    l2_ = F.relu(self.l2(l1_))
-    x = self.output(l2_)
+    us = self.quant(us)
+    them = self.quant(them)
+    w_in = self.quant(w_in)
+    b_in = self.quant(b_in)
+    w = self.input(w_in)
+    b = self.input(b_in)
+    l0_ = self.input_add.add(self.input_mul.mul(us, torch.cat([w, b], dim=1)),
+                             self.input_mul.mul(them, torch.cat([b, w], dim=1)))
+    l0_ = self.input_act(l0_)
+    l1_ = self.l1_act(self.l1(l0_))
+    l2_ = self.l2_act(self.l2(l1_))
+    l3_ = self.l3_act(self.l3(l2_))
+    x = self.output(l3_)
+    x = self.dequant(x)
     return x
 
   def step_(self, batch, batch_idx, loss_type):
@@ -117,7 +119,7 @@ class NNUE(pl.LightningModule):
     nnue2score = 600
     scaling = 361
 
-    q = self.swa_model(us, them, white, black) * nnue2score / scaling
+    q = self(us, them, white, black) * nnue2score / scaling
     t = outcome
     p = (score / scaling).sigmoid()
 
@@ -156,7 +158,7 @@ class NNUE(pl.LightningModule):
     # increasing the eps leads to less saturated nets with a few dead neurons
     optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
     # Drop learning rate after 75 epochs
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=125, gamma=0.25)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
     return [optimizer], [scheduler]
 
   def get_layers(self, filt):
@@ -166,5 +168,7 @@ class NNUE(pl.LightningModule):
     """
     for i in self.children():
       if filt(i):
-        for p in i.parameters():
-          yield p
+        if isinstance(i, nn.Linear):
+          for p in i.parameters():
+            if p.requires_grad:
+              yield p

@@ -1,0 +1,216 @@
+import argparse
+import features
+import model
+import qmodel as M
+import nnue_bin_dataset
+import numpy
+import pytorch_lightning as pl
+import struct
+import torch
+from metrics import compute_mse
+from torch.utils.data import DataLoader
+from torch import nn
+
+def coalesce_ft_weights(model, layer):
+  weight = layer.weight.data
+  indices = model.feature_set.get_virtual_to_real_features_gather_indices()
+  weight_coalesced = weight.new_zeros((weight.shape[0], model.feature_set.num_real_features))
+  for i_real, is_virtual in enumerate(indices):
+    weight_coalesced[:, i_real] = sum(weight[:, i_virtual] for i_virtual in is_virtual)
+  return weight_coalesced
+
+# hardcoded for now
+VERSION = 0x7AF32F16
+
+class NNUEWriter():
+  """
+  All values are stored in little endian.
+  """
+  def __init__(self, model):
+    self.buf = bytearray()
+
+    fc_hash = self.fc_hash(model)
+    self.write_header(model, fc_hash)
+    self.uint32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.write_feature_transformer(model)
+    self.uint32(fc_hash) # FC layers hash
+    self.write_fc_layer(model.l1, model.input)
+    self.write_fc_layer(model.l2, model.l1)
+    self.write_fc_layer(model.output, model.l2, is_output=True)
+
+  @staticmethod
+  def fc_hash(model):
+    # InputSlice hash
+    prev_hash = 0xEC42E90D
+    prev_hash ^= (M.L1 * 2)
+
+    # Fully connected layers
+    layers = [model.l1, model.l2, model.output]
+    for layer in layers:
+      layer_hash = 0xCC03DAE4
+      layer_hash += layer.out_features
+      layer_hash ^= prev_hash >> 1
+      layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF
+      prev_hash = layer_hash
+    return layer_hash
+
+  def write_header(self, model, fc_hash):
+    self.uint32(VERSION) # version
+    self.uint32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    description = b"Features=HalfKP(Friend)[41024->256x2],"
+    description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-32]"
+    description += b"(ClippedReLU[32](AffineTransform[32<-512](InputSlice[512(0:512)])))))"
+    self.uint32(len(description)) # Network definition
+    self.buf.extend(description)
+
+  def write_quant_params(self, layer, prev, is_output=False):
+    # layer.scale - activation scale
+    # layer.zero_point - activation zero point
+    # layer.weight().q_scale() - weight scale
+    # layer.weight().q_zero_point() - weight zero point
+    # input ones come from the activations of the previous layer.
+    input_scale = 1.0 if prev is None else prev.scale
+    weight_scale = layer.weight().q_scale()
+    output_scale = 1.0 if is_output else layer.scale
+
+    weight_zero_point = layer.weight().q_zero_point()
+
+    scale_float = input_scale * weight_scale / output_scale
+    assert(scale_float >= 0 and scale_float <= 1.0)
+
+    scale_bits = 31
+    scale = int(scale_float * (2**scale_bits))
+
+    self.int32(scale)
+    self.int32(scale_bits)
+    self.int32(weight_zero_point)
+
+    bias_scale = input_scale * weight_scale
+    return bias_scale
+
+  def write_feature_transformer(self, model):
+    layer = model.input
+    bias_scale = self.write_quant_params(layer, None)
+
+    bias = (layer.bias().data / bias_scale).round().to(torch.int16)
+    self.buf.extend(bias.flatten().numpy().tobytes())
+
+    weight = layer.weight().data.int_repr()
+    # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
+    self.buf.extend(weight.transpose(0, 1).flatten().numpy().tobytes())
+
+  def write_fc_layer(self, layer, prev, is_output=False):
+    bias_scale = self.write_quant_params(layer, prev, is_output)
+
+    bias = (layer.bias().data / bias_scale).round().to(torch.int32)
+    self.buf.extend(bias.flatten().numpy().tobytes())
+    weight = layer.weight().data.int_repr()
+    # FC inputs are padded to 32 elements for simd.
+    num_input = weight.shape[1]
+    if num_input % 32 != 0:
+      num_input += 32 - (num_input % 32)
+      new_w = torch.zeros(weight.shape[0], num_input, dtype=torch.int8)
+      new_w[:, :weight.shape[1]] = weight
+      weight = new_w
+    # Stored as [outputs][inputs], so we can flatten
+    self.buf.extend(weight.flatten().numpy().tobytes())
+
+  def int32(self, v):
+    self.buf.extend(struct.pack("<i", v))
+
+  def uint32(self, v):
+    self.buf.extend(struct.pack("<I", v))
+
+def qmodel_from_model(baseline):
+  halfkp = features.get_feature_set_from_name('HalfKP')
+  qm = M.NNUE(halfkp)
+  qm.eval()
+  layers = ['input', 'l1', 'l2', 'output']
+  for name in layers:
+    setattr(qm, name, getattr(baseline, name))
+  qm.input.weight = nn.Parameter(coalesce_ft_weights(baseline, baseline.input))
+  qm.input.in_features = halfkp.num_real_features
+  return qm
+
+def get_loader(feature_set_name, binfile):
+  halfkp = features.get_feature_set_from_name(feature_set_name)
+  train = nnue_bin_dataset.NNUEBinData(binfile, halfkp)
+  return DataLoader(torch.utils.data.Subset(train, range(0, 1024)), batch_size=64)
+
+def load_model(ckpt_name):
+  # Hardcoded to convert from HalfKP^ right now...
+  factorized = features.get_feature_set_from_name('HalfKP^')
+  nnue = model.NNUE.load_from_checkpoint(ckpt_name, map_location='cpu', feature_set=factorized)
+  nnue.eval()
+  return nnue
+
+def dump_activations(model):
+  import chess
+  converter = nnue_bin_dataset.ToTensor(features.get_feature_set_from_name('HalfKP'))
+  bd = chess.Board(fen='6k1/4pp1p/3p2p1/P1pPb3/R7/1r2P1PP/3B1P2/5QK1 w - - 0 1')
+  #bd = chess.Board()
+  us, them, w_in, b_in, _, _ = converter((bd, None, 0, 0.0))
+  us = us.unsqueeze(0)
+  them = them.unsqueeze(0)
+  w_in = w_in.unsqueeze(0)
+  b_in = b_in.unsqueeze(0)
+
+  def get_activation(layer_name):
+    def hook(model, input, output):
+      activation = output.detach()
+      print(layer_name)
+      print(activation)
+    return hook
+
+  model.input.register_forward_hook(get_activation('input'))
+  model.l1.register_forward_hook(get_activation('l1'))
+  model.l2.register_forward_hook(get_activation('l2'))
+  model.output.register_forward_hook(get_activation('output'))
+  print(model(us, them, w_in, b_in))
+
+def main():
+  parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
+  parser.add_argument("source", help="Source file (.ckpt).  Only supports HalfKP^")
+  parser.add_argument("target", help="Target file (.nnue)")
+  parser.add_argument("binfile", help=".bin file for activation statistics, will only use first 1000 positions currently")
+  features.add_argparse_args(parser)
+  args = parser.parse_args()
+
+  trainer = pl.Trainer(progress_bar_refresh_rate=0)
+  baseline = load_model(args.source)
+  #print('baseline:', trainer.test(baseline, get_loader('HalfKP^', args.binfile), verbose=False))
+
+  nnue = qmodel_from_model(baseline)
+  loader = get_loader('HalfKP', args.binfile)
+  #print('converted to quantized net, and fused factorizer:', trainer.test(nnue, loader, verbose=False))
+
+  fuse_layers = [
+    ['input', 'input_act'],
+    ['l1', 'l1_act'],
+    ['l2', 'l2_act'],
+  ]
+  torch.quantization.fuse_modules(nnue, fuse_layers, inplace=True)
+
+  # fbgemm config uses per-channel quantization, which is more accurate, but will be more implementation work.
+  #nnue.qconfig = torch.quantization.get_default_qconfig('fbgemm')
+
+  # HistogramObserver is most accurate, but can only be used for static quantization.
+  #   reduce_range=True means the quantization is limited to 0..127 - this is useful for SSE optimizations.
+  nnue.qconfig = torch.quantization.QConfig(
+      activation=torch.quantization.HistogramObserver.with_args(reduce_range=True),
+      weight=torch.quantization.MinMaxObserver.with_args(dtype=torch.qint8, qscheme=torch.per_tensor_affine))
+  nnue_prep = torch.quantization.prepare(nnue)
+  # This feeds the nnue_prep net a bunch of positions to measure the activation statistics.
+  trainer.test(nnue_prep, loader, verbose=False)
+
+  nnue_int8 = torch.quantization.convert(nnue_prep)
+  torch.jit.save(torch.jit.script(nnue_int8), 'quantized.pt')
+  #dump_activations(nnue_int8)
+  #print('quantized net:', trainer.test(nnue_int8, loader, verbose=False))
+
+  writer = NNUEWriter(nnue_int8)
+  with open(args.target, 'wb') as f:
+    f.write(writer.buf)
+
+if __name__ == '__main__':
+  main()

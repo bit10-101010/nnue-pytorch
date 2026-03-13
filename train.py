@@ -227,64 +227,20 @@ def main():
 
     logdir = args.default_root_dir if args.default_root_dir else "logs/"
 
-    tb_logger = pl_loggers.TensorBoardLogger(logdir)
+  tb_logger = pl_loggers.TensorBoardLogger(logdir)
+  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True, save_top_k=2, monitor='val_loss')
+  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
-    print("Using log dir {}".format(tb_logger.log_dir), flush=True)
+  main_device = trainer.root_device if trainer.root_gpu is None else 'cuda:' + str(trainer.root_gpu)
 
-    checkpoint_callback = ModelCheckpoint(
-        save_last=args.save_last_network,
-        every_n_epochs=args.network_save_period,
-        save_top_k=-1,
-    )
+  if args.py_data:
+    print('Using python data loader')
+    train, val = data_loader_py(args.train, args.val, feature_set, batch_size, main_device)
+  else:
+    print('Using c++ data loader')
+    train, val = data_loader_cc(args.train, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device)
 
-    nnue = torch.compile(nnue, backend=args.compile_backend)
-    # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
-    # see lightning/fabric/plugins/environments/slurm.py near line 110
-    os.environ["SLURM_JOB_NAME"] = "bash"
-
-    refresh_rate = max(1, (nnue.num_batches_per_epoch + 4) // 5)
-    trainer = L.Trainer(
-        default_root_dir=logdir,
-        max_epochs=args.max_epochs,
-        accelerator="cuda",
-        strategy="ddp" if len(devices) > 1 else "auto",
-        devices=devices,
-        logger=tb_logger,
-        callbacks=[
-            checkpoint_callback,
-            TQDMProgressBar(refresh_rate=refresh_rate),
-            TimeLimitAfterCheckpoint(args.max_time),
-            M.WeightClippingCallback(),
-        ],
-        enable_progress_bar=True,
-        enable_checkpointing=True,
-        benchmark=True,
-        num_sanity_val_steps=0,
-    )
-
-    if actual_threads > 0:
-        print("Set torch num_threads to {} threads.".format(actual_threads))
-        t_set_num_threads(actual_threads)
-    else:
-        print("Using default torch num_threads setting.", flush=True)
-    print(f"Using {actual_workers} workers for C++ data loader.", flush=True)
-    train, val = make_data_loaders(
-        train_datasets,
-        val_datasets,
-        input_feature_name,
-        actual_workers,
-        per_gpu_batch_size,
-        args.dataloader_config,
-        args.epoch_size,
-        args.validation_size,
-        pin_memory=args.pin_memory,
-        queue_size_limit=args.data_loader_queue_size,
-    )
-
-    if args.resume_from_checkpoint:
-        trainer.fit(nnue, train, val, ckpt_path=args.resume_from_checkpoint)
-    else:
-        trainer.fit(nnue, train, val)
+  trainer.fit(nnue, train, val)
 
     if trainer.is_global_zero:
         with open(os.path.join(logdir, "training_finished"), "w"):
