@@ -1,9 +1,12 @@
-import chess
+from collections import namedtuple
 import ranger
 import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # 3 layer fully connected network
 L1 = 256
@@ -20,15 +23,23 @@ class NNUE(pl.LightningModule):
 
   lambda_ = 0.0 - purely based on game results
   lambda_ = 1.0 - purely based on search scores
-
-  It is not ideal for training a Pytorch quantized model directly.
   """
   def __init__(self, feature_set, lambda_=1.0):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
+    weights = self.input.weight.clone()
+    kMaxActiveDimensions = 32
+    kSigma = 0.1 / math.sqrt(kMaxActiveDimensions)
+    weights = weights.normal_(0.0, kSigma)
+    biases = self.input.bias
+    biases = biases.clone().fill_(0.5)
+    self.input.weight = nn.Parameter(weights)
+    self.input.bias = nn.Parameter(biases)
     self.feature_set = feature_set
     self.l1 = nn.Linear(2 * L1, L2)
+    self.bn_l1 = nn.BatchNorm1d(num_features=L2)
     self.l2 = nn.Linear(L2, L3)
+    self.bn_l2 = nn.BatchNorm1d(num_features=L3)
     self.output = nn.Linear(L3, 1)
 
     self.policy_l1 = nn.Linear(2 * L1, POLICY_L1)
@@ -37,6 +48,7 @@ class NNUE(pl.LightningModule):
 
     self.lambda_ = lambda_
 
+    self.swa_model = AveragedModel(self)
     self._zero_virtual_feature_weights()
 
   '''
@@ -58,6 +70,8 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
+    self.swa_model = AveragedModel(self)
+
     if self.feature_set.name == new_feature_set.name:
       return
 
@@ -93,6 +107,8 @@ class NNUE(pl.LightningModule):
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
   def forward(self, us, them, w_in, b_in):
+    return self.quant_forward(us, them, w_in, b_in)
+
     w = self.input(w_in)
     b = self.input(b_in)
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
@@ -110,6 +126,7 @@ class NNUE(pl.LightningModule):
 
   def step_(self, batch, batch_idx, loss_type):
     us, them, white, black, outcome, score, move = batch
+    us, them, white, black, outcome, score, ply = batch
 
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
     # This needs to match the value used in the serializer
@@ -119,11 +136,15 @@ class NNUE(pl.LightningModule):
     q, moves = self(us, them, white, black)
     q = q * nnue2score / scaling
     t = outcome
+    q = self(us, them, white, black) * nnue2score / scaling
+    # Normalize ply to [0,1].
+    ply = torch.clamp((ply - 40) / 100.0, 0.0, 1.0)
     p = (score / scaling).sigmoid()
+    # Interpolate from eval at ply = 0, to game score at ply = 1.
+    p = (1.0 - ply) * p + ply * outcome
 
     epsilon = 1e-12
     teacher_entropy = -(p * (p + epsilon).log() + (1.0 - p) * (1.0 - p + epsilon).log())
-    outcome_entropy = -(t * (t + epsilon).log() + (1.0 - t) * (1.0 - t + epsilon).log())
     teacher_loss = -(p * F.logsigmoid(q) + (1.0 - p) * F.logsigmoid(-q))
     outcome_loss = -(t * F.logsigmoid(q) + (1.0 - t) * F.logsigmoid(-q))
     result  = self.lambda_ * teacher_loss    + (1.0 - self.lambda_) * outcome_loss
@@ -134,6 +155,16 @@ class NNUE(pl.LightningModule):
     self.log(loss_type + '_value_loss', value_loss)
     self.log(loss_type + '_policy_loss', policy_loss)
     return value_loss + policy_loss
+    result  = self.lambda_ * teacher_loss
+    entropy = self.lambda_ * teacher_entropy
+    loss = result.mean() - entropy.mean()
+    self.log(loss_type, loss)
+    return loss
+
+    # MSE Loss function for debugging
+    # Scale score by 600.0 to match the expected NNUE scaling factor
+    # output = self(us, them, white, black) * 600.0
+    # loss = F.mse_loss(output, score)
 
   def training_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'train')
@@ -145,8 +176,24 @@ class NNUE(pl.LightningModule):
     self.step_(batch, batch_idx, 'test')
 
   def configure_optimizers(self):
+    # Train with a lower LR on the output layer
+    LR = 1e-3
+    train_params = [
+      {'params': self.get_layers(lambda x: self.output != x), 'lr': LR},
+      {'params': self.get_layers(lambda x: self.output == x), 'lr': LR / 10},
+    ]
     # increasing the eps leads to less saturated nets with a few dead neurons
-    optimizer = ranger.Ranger(self.parameters(),betas=(.9, 0.999), eps=1.0e-7)
+    optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
     # Drop learning rate after 75 epochs
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=125, gamma=0.25)
     return [optimizer], [scheduler]
+
+  def get_layers(self, filt):
+    """
+    Returns a list of layers.
+    filt: Return true to include the given layer.
+    """
+    for i in self.children():
+      if filt(i):
+        for p in i.parameters():
+          yield p
