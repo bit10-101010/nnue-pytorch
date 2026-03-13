@@ -124,9 +124,17 @@ What this document DOES NOT contain:
     + [Simple HalfKP Stockfish architecture](#simple-halfkp-stockfish-architecture)
     + [HalfKAv2 feature set.](#halfkav2-feature-set)
     + [HalfKAv2_hm feature set.](#halfkav2_hm-feature-set)
+    + [Full_Threats feature set.](#full_threats-feature-set)
+        - [Deduplicating features](#deduplicating-features)
+        - [I8 quantization for threat feature weights](#i8-quantization-for-threat-feature-weights)
     + [A part of the feature transformer directly forwarded to the output.](#a-part-of-the-feature-transformer-directly-forwarded-to-the-output)
     + [Multiple PSQT outputs and multiple subnetworks](#multiple-psqt-outputs-and-multiple-subnetworks)
 * [Historical Stockfish evaluation network architectures](#historical-stockfish-evaluation-network-architectures)
+    + ["SFNNv13" architecture](#sfnnv13-architecture)
+    + ["SFNNv12" architecture](#sfnnv12-architecture)
+    + ["SFNNv11" architecture](#sfnnv11-architecture)
+    + ["SFNNv10" architecture](#sfnnv10-architecture)
+    + ["SFNNv9" architecture](#sfnnv9-architecture)
     + ["SFNNv8" architecture](#sfnnv8-architecture)
     + ["SFNNv7" architecture](#sfnnv7-architecture)
     + ["SFNNv6" architecture](#sfnnv6-architecture)
@@ -288,7 +296,7 @@ Even though we observed that few inputs change from position to position we have
 
 For a single move, it's trivial to find which "A" features changed - we know what piece we're moving, from where, and where to. Captures and promotions can be considered as a piece disappearing or appearing from nowhere.
 
-However, care must taken when using floating point values. Repeatedly adding and subtracting floats results in error that accumulates with each move. It requires careful evaluation of whether the error is small enough for the net to still produce good results. Thankfully, it is best implemented such that the accumulator is not updated when undoing a move. Instead, it is simply stored on the search stack, so the error is bounded by `O(MAX_DEPTH)` and can mostly be ignored.
+However, care must be taken when using floating point values. Repeatedly adding and subtracting floats results in error that accumulates with each move. It requires careful evaluation of whether the error is small enough for the net to still produce good results. Thankfully, it is best implemented such that the accumulator is not updated when undoing a move. Instead, it is simply stored on the search stack, so the error is bounded by `O(MAX_DEPTH)` and can mostly be ignored.
 
 When using quantization this is no longer a problem, the incremental implementation is consistent, but now there is a possibility of overflowing the accumulator (regardless of whether incremental updates are used or not). The quantization scheme must be chosen such that no combination of possible active features can exceed the maximum value.
 
@@ -569,7 +577,7 @@ Pytorch has built-in types for linear layers, so defining the model is pretty si
 ```python
 class NNUE(nn.Module):
     def __init__(self):
-        super(NNUE, self).__init__()
+        super().__init__()
 
         self.ft = nn.Linear(NUM_FEATURES, M)
         self.l1 = nn.Linear(2 * M, N)
@@ -2827,7 +2835,7 @@ class FeatureTransformerSliceFunction(autograd.Function):
 
 class FeatureTransformerSlice(nn.Module):
     def __init__(self, num_inputs, num_outputs):
-        super(FeatureTransformerSlice, self).__init__()
+        super().__init__()
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
 
@@ -2859,6 +2867,28 @@ HalfKA feature set was briefly mentioned in this document as a brother of HalfKP
 "hm" here stands for "horizontally mirrored". This feature set is basically HalfKAv2, but the board is assumed to have horizontal symmetry. While this assumption obviously doesn't hold in chess it works well in practice. The idea behind this feature set is to, for each perspective, transform the board such that our king is on the e..h files (by convention, could also be a..d file). Knowing that only half of the king squares will be used allows us to cut the number of input features in half, effectively halving the size of the feature transformer. Stockfish uses this feature set since early August 2021 to support large feature transformers without the need for inconveniently large nets. This has also been used in Scorpio, along with other ways of minimizing the network size.
 
 Let's consider an example where the white king is on a1 and the black king on g1. The board will have to be mirrored horizontally for the white's perspective to put the king within the e..h files; from black's perspective, the king is already within the e..h files. At first sight it may appear that this creates discrepancies between the perspective in cases where the board is mirrored only for one perspective, but it works out remarkably well in practice - the strength difference is hardly measurable.
+
+### Full_Threats feature set.
+
+Full threat inputs models a subset of "AA" (i.e. pairs of "A" features), specifically the ones where the first piece attacks the second. For example, "white queen on d1 attacks black knight on h5" is encoded as "stm queen on d1 attacks nstm knight on h5" for white's perspective and "nstm queen on d8 attacks stm knight on h4" for black's perspective.
+
+Threat input features are also mirrored horizontally by perspective (the mirroring currently is to a..d files, a legacy of an initial design choice for ease of debugging). In practice, refreshes are uncommon, so their cost is negligible.
+
+Threat features alone are not sufficient for evaluation (how can you distinguish positions where there are no threats, for instance?) and hence function as an add-on to a feature set such as HalfKAv2_hm. One can think of "piece" features like HalfKAv2_hm as providing the foundation, while the "threat" features add many minor corrections.
+
+Since threat features have different refresh patterns (for instance, they do not need to be refreshed every king move, but only when one crosses the d-e files), they are accumulated separately. The two accumulators are combined at evaluation time.
+
+#### Deduplicating features
+
+Several threat features are redundant. For example, if a rook is attacking a queen, it is guaranteed that the queen will also be attacking the rook, and hence it is unnecessary to consider any feature of the form "rook attacks queen". Generalizing, we can remove all features where the attacking piece's attack set is a subset of the attacked piece's attack set (pb, pq, pk, bq, rq, kq). King-king threat features can never be legal, so we also remove them.
+
+If the two pieces are identical type, then one feature of the pair will also be redundant. In this case, we remove the feature where the numerical square (0 - 63) of the attacking piece is less than that of the attacked piece.
+
+Since evaluation is not called in check, attacks to a king are also redundant, though accounting for this has not gained in practice.
+
+#### I8 quantization for threat feature weights
+
+The number of active and changing threat features depends on the position, but is typically higher when more pieces (especially the queens) are on the board. In a typical midgame position, there might be 3-4x as many changing threat features as piece features, and memory bandwidth becomes a bottleneck for accumulation speed. We thus store threat features as i8 and convert them to i16 on the fly during accumulation. This process seems to increase speed much more on ARM architectures (+10%) compared to x86 (+5%). Because threat feature weights are typically not high in absolute value (see our earlier comment regarding the separation between threat and piece features), we can clip them during training with negligible loss in evaluation quality.
 
 ### A part of the feature transformer directly forwarded to the output.
 
@@ -2893,7 +2923,7 @@ L3 = 32
 
 class LayerStacks(nn.Module):
     def __init__(self, count):
-        super(LayerStacks, self).__init__()
+        super().__init__()
 
         self.count = count
         # Layers are larger, very good for GPUs
@@ -2958,11 +2988,61 @@ y = self.layer_stacks(l0_, layer_stack_indices) + (wpsqt - bpsqt) * (us - 0.5)
 
 ## Historical Stockfish evaluation network architectures
 
+### "SFNNv13" architecture
+
+Same as "SFNNv12" with L2 size increased to 32.
+
+2026-02-18 - *
+
+[Commit a6d055d7e27ab3e29a42e8b94215102824760057](https://github.com/official-stockfish/Stockfish/commit/a6d055d7e27ab3e29a42e8b94215102824760057)
+
+![](img/SFNNv13_architecture_detailed_v2.svg)
+
+### "SFNNv12" architecture
+
+Same as "SFNNv10" with FullThreats+HalfKAv2_hm input features compressed to 82672 indices.
+
+2026-02-12 - 2026-02-18
+
+[Commit 83e42045a62c3690a6ee29862679403ea1644728](https://github.com/official-stockfish/Stockfish/commit/83e42045a62c3690a6ee29862679403ea1644728)
+
+![](img/SFNNv12_architecture_detailed_v2.svg)
+
+### "SFNNv11" architecture
+
+Same as "SFNNv10" with FullThreats+HalfKAv2_hm input features compressed to 89392 indices.
+
+2026-02-04 - 2026-02-12
+
+[Commit fac506bdf3f0ed46fd0823ff1ed592824f91aa5a](https://github.com/official-stockfish/Stockfish/commit/fac506bdf3f0ed46fd0823ff1ed592824f91aa5a)
+
+![](img/SFNNv11_architecture_detailed_v2.svg)
+
+### "SFNNv10" architecture
+
+Same as "SFNNv5" with FullThreats+HalfKAv2_hm input features, L1 size reduced to 1024, and 255 as the feature transformer quantization scale.
+
+2025-11-12 - 2026-02-04
+
+[Commit 8e5392d79a36aba5b997cf6fb590937e3e624e80](https://github.com/official-stockfish/Stockfish/commit/8e5392d79a36aba5b997cf6fb590937e3e624e80)
+
+![](img/SFNNv10_architecture_detailed_v2.svg)
+
+### "SFNNv9" architecture
+
+Same as "SFNNv5" with L1 size increased to 3072.
+
+2024-04-01 - 2025-11-12
+
+[Commit 0716b845fdef8a20102b07eaec074b8da8162523](https://github.com/official-stockfish/Stockfish/commit/0716b845fdef8a20102b07eaec074b8da8162523)
+
+![](img/SFNNv9_architecture_detailed_v2.svg)
+
 ### "SFNNv8" architecture
 
 Same as "SFNNv5" with L1 size increased to 2560.
 
-2023-09-22 - *
+2023-09-22 - 2024-04-01
 
 [Commit 782c32223583d7774770fc56e50bd88aae35cd1a](https://github.com/official-stockfish/Stockfish/commit/70ba9de85cddc5460b1ec53e0a99bee271e26ece)
 
