@@ -1,6 +1,9 @@
 import argparse
-import features
-import math
+import hashlib
+import os
+
+import torch
+
 import model as M
 import numpy
 import nnue_bin_dataset
@@ -10,6 +13,27 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from functools import reduce
 import operator
+
+def fuse_bn(linear, bn):
+  w = linear.weight
+  mean = bn.running_mean
+  var_sqrt = torch.sqrt(bn.running_var + bn.eps)
+  beta = bn.weight
+  gamma = bn.bias
+  b = linear.bias
+  w = w * (beta / var_sqrt).reshape([linear.out_features, 1])
+  b = (b - mean) / var_sqrt * beta + gamma
+
+  fused_linear = torch.nn.Linear(linear.in_features, linear.out_features)
+  fused_linear.weight = torch.nn.Parameter(w)
+  fused_linear.bias = torch.nn.Parameter(b)
+  return fused_linear
+
+def fuse_bn_model(model):
+  model.input = fuse_bn(model.input, model.bn_input)
+  model.l1 = fuse_bn(model.l1, model.bn_l1)
+  model.l2 = fuse_bn(model.l2, model.bn_l2)
+  return model
 
 def ascii_hist(name, x, bins=6):
   N,X = numpy.histogram(x, bins=bins)
@@ -33,14 +57,35 @@ class NNUEWriter():
   """
   def __init__(self, model):
     self.buf = bytearray()
+    model = fuse_bn_model(model)
 
     self.write_header(model)
     self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
     self.write_feature_transformer(model)
-    self.int32(FC_HASH) # FC layers hash
+    self.int32(fc_hash) # FC layers hash
     self.write_fc_layer(model.l1)
     self.write_fc_layer(model.l2)
+    self.write_fc_layer(model.l3)
     self.write_fc_layer(model.output, is_output=True)
+
+  @staticmethod
+  def fc_hash(model):
+    # InputSlice hash
+    prev_hash = 0xEC42E90D
+    prev_hash ^= (M.L1 * 2)
+
+    # Fully connected layers
+    layers = [model.l1, model.l2, model.l3, model.output]
+    for layer in layers:
+      layer_hash = 0xCC03DAE4
+      layer_hash += layer.out_features
+      layer_hash ^= prev_hash >> 1
+      layer_hash ^= (prev_hash << 31) & 0xFFFFFFFF
+      if layer.out_features != 1:
+        # Clipped ReLU hash
+        layer_hash = (layer_hash + 0x538D24C7) & 0xFFFFFFFF
+      prev_hash = layer_hash
+    return layer_hash
 
   def write_header(self, model):
     self.int32(VERSION) # version
@@ -65,12 +110,12 @@ class NNUEWriter():
     # int16 weight = round(x * 127)
     layer = model.input
     bias = layer.bias.data
-    bias = bias.mul(127).round().to(torch.int16)
+    #bias = bias.mul(127).round().to(torch.int16)
     ascii_hist('ft bias:', bias.numpy())
     self.buf.extend(bias.flatten().numpy().tobytes())
 
     weight = self.coalesce_ft_weights(model, layer)
-    weight = weight.mul(127).round().to(torch.int16)
+    #weight = weight.mul(127).round().to(torch.int16)
     ascii_hist('ft weight:', weight.numpy())
     # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
     self.buf.extend(weight.transpose(0, 1).flatten().numpy().tobytes())
@@ -89,7 +134,7 @@ class NNUEWriter():
     # int32 bias = round(x * kBiasScale)
     # int8 weight = round(x * kWeightScale)
     bias = layer.bias.data
-    bias = bias.mul(kBiasScale).round().to(torch.int32)
+    #bias = bias.mul(kBiasScale).round().to(torch.int32)
     ascii_hist('fc bias:', bias.numpy())
     self.buf.extend(bias.flatten().numpy().tobytes())
     weight = layer.weight.data
@@ -97,7 +142,7 @@ class NNUEWriter():
     total_elements = torch.numel(weight)
     clipped_max = torch.max(torch.abs(weight.clamp(-kMaxWeight, kMaxWeight) - weight))
     print("layer has {}/{} clipped weights. Exceeding by {} the maximum {}.".format(clipped, total_elements, clipped_max, kMaxWeight))
-    weight = weight.clamp(-kMaxWeight, kMaxWeight).mul(kWeightScale).round().to(torch.int8)
+    #weight = weight.clamp(-kMaxWeight, kMaxWeight).mul(kWeightScale).round().to(torch.int8)
     ascii_hist('fc weight:', weight.numpy())
     # Stored as [outputs][inputs], so we can flatten
     self.buf.extend(weight.flatten().numpy().tobytes())
@@ -157,27 +202,90 @@ class NNUEReader():
     return v
 
 def main():
-  parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
-  parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
-  parser.add_argument("target", help="Target file (can be .pt or .nnue)")
-  features.add_argparse_args(parser)
-  args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Converts files between ckpt and nnue format."
+    )
+    parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
+    parser.add_argument("target", help="Target file (can be .pt or .nnue)")
+    parser.add_argument(
+        "--out-sha",
+        action="store_true",
+        dest="out_sha",
+        help="Ignore target file name and save as nn-<sha>.nnue. If target is a directory, the file is placed there; otherwise it goes to dirname(target) or CWD.",
+    )
+    parser.add_argument(
+        "--description",
+        default=None,
+        type=str,
+        dest="description",
+        help="The description string to include in the network. Only works when serializing into a .nnue file.",
+    )
+    parser.add_argument(
+        "--ft_compression",
+        default="leb128",
+        type=str,
+        dest="ft_compression",
+        help="Compression method to use for FT weights and biases. Either 'none' or 'leb128'. Only allowed if saving to .nnue.",
+    )
+    parser.add_argument(
+        "--ft_perm",
+        default=None,
+        type=str,
+        dest="ft_perm",
+        help="Path to a file that defines the permutation to use on the feature transformer.",
+    )
+    parser.add_argument(
+        "--ft_optimize",
+        action="store_true",
+        dest="ft_optimize",
+        help="Whether to perform full feature transformer optimization (ftperm.py) on the resulting network. This process is very time consuming.",
+    )
+    parser.add_argument(
+        "--ft_optimize_data",
+        default=None,
+        type=str,
+        dest="ft_optimize_data",
+        help="Path to the dataset to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--ft_optimize_count",
+        default=10000,
+        type=int,
+        dest="ft_optimize_count",
+        help="Number of positions to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--no-cupy",
+        action="store_false",
+        dest="use_cupy",
+        help="Disable CUPY usage if not enough GPU memory is available. This will use numpy instead, which is slower.",
+    )
+    parser.add_argument(
+        "--device", type=int, default="0", help="Device to use for cupy"
+    )
 
-  feature_set = features.get_feature_set_from_name(args.features)
+    M.ModelConfig.add_model_args(parser)
+    M.add_feature_args(parser)
+    args = parser.parse_args()
 
-  print('Converting %s to %s' % (args.source, args.target))
+    feature_name = args.features
+
+    print("Converting %s to %s" % (args.source, args.target))
 
   if args.source.endswith(".pt") or args.source.endswith(".ckpt"):
-    if not args.target.endswith(".nnue"):
-      raise Exception("Target file must end with .nnue")
     if args.source.endswith(".pt"):
       nnue = torch.load(args.source)
     else:
       nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
     nnue.eval()
-    writer = NNUEWriter(nnue)
-    with open(args.target, 'wb') as f:
-      f.write(writer.buf)
+    if args.target.endswith(".nnue"):
+      writer = NNUEWriter(nnue)
+      with open(args.target, 'wb') as f:
+        f.write(writer.buf)
+    elif args.target.endswith(".pt"):
+      torch.save(nnue, args.target)
+    else:
+      raise Exception("Target file must end with .nnue or .pt")
   elif args.source.endswith(".nnue"):
     if not args.target.endswith(".pt"):
       raise Exception("Target file must end with .pt")
@@ -187,5 +295,5 @@ def main():
   else:
     raise Exception('Invalid filetypes: ' + str(args))
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    main()
