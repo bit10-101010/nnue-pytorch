@@ -28,8 +28,8 @@ def is_safe_model_path(filename):
     if os.path.commonpath([resolved_path, base_dir]) != base_dir:
         raise ValueError(f"Refusing to load model outside of base directory: {filename}")
 
-    # Disallow symlinked files explicitly.
-    if os.path.islink(filename):
+    # Disallow symlinked files explicitly, using the resolved safe path.
+    if os.path.islink(resolved_path):
         raise ValueError(f"Refusing to load model from symlink: {filename}")
 
     return resolved_path
