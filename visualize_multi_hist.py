@@ -1,0 +1,223 @@
+import argparse
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+
+from serialize import NNUEReader
+import os
+
+def is_safe_model_path(filename):
+    """
+    Perform basic validation to ensure that the model file path is within
+    the current working directory tree and is not a symlink.
+    This is intended to reduce the risk of loading arbitrary files when
+    using torch.load (which relies on pickle and is unsafe for untrusted
+    input).
+    """
+    # Resolve the absolute, normalized path of the requested file.
+    resolved_path = os.path.realpath(filename)
+
+    # Define the base directory for allowed model files.
+    base_dir = os.path.realpath(os.getcwd())
+
+    # Ensure the resolved path is under the base directory.
+    if os.path.commonpath([resolved_path, base_dir]) != base_dir:
+        raise ValueError(f"Refusing to load model outside of base directory: {filename}")
+
+    # Disallow symlinked files explicitly, using the resolved safe path.
+    if os.path.islink(resolved_path):
+        raise ValueError(f"Refusing to load model from symlink: {filename}")
+
+    return resolved_path
+
+def load_model(filename, feature_set):
+    # Validate and normalize the path before loading any model file.
+    # This ensures that all supported formats (.pt, .ckpt, .nnue) are
+    # constrained to a safe directory tree.
+    safe_filename = is_safe_model_path(filename)
+    if safe_filename.endswith(".pt") or safe_filename.endswith(".ckpt"):
+        # For .pt files, load only the tensor weights into a freshly
+        # constructed model rather than deserializing an arbitrary object
+        # graph.
+        if safe_filename.endswith(".pt"):
+            state_dict = torch.load(safe_filename, map_location='cpu', weights_only=True)
+            model = M.NNUE(feature_set=feature_set)
+            model.load_state_dict(state_dict)
+        else:
+            model = M.NNUE.load_from_checkpoint(
+                safe_filename, feature_set=feature_set)
+        model.eval()
+    elif safe_filename.endswith(".nnue"):
+        with open(safe_filename, 'rb') as f:
+            reader = NNUEReader(f, feature_set)
+        model = reader.model
+    else:
+        raise Exception("Invalid filetype: " + str(filename))
+
+    return model
+
+def get_bins(inputs_columns, num_bins):
+    a = float("+inf")
+    b = float("-inf")
+    for inputs in inputs_columns:
+        for inp in inputs:
+            a = min(a, float(np.min(inp)))
+            b = max(b, float(np.max(inp)))
+    a -= 0.001
+    b += 0.001
+    return [a + (b - a) / num_bins * i for i in range(num_bins + 1)]
+
+
+def plot_hists(
+    tensors_columns,
+    row_names,
+    col_names,
+    w=8.0,
+    h=3.0,
+    title=None,
+    num_bins=256,
+    filename="a.png",
+):
+    fig, axs = plt.subplots(
+        len(tensors_columns[0]),
+        len(tensors_columns),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+        figsize=(w * len(tensors_columns), h * len(tensors_columns[0])),
+        dpi=100,
+    )
+    if title:
+        fig.suptitle(title)
+    bins = get_bins(tensors_columns, num_bins)
+    for i, tensors in enumerate(tensors_columns):
+        print("Processing column {}/{}.".format(i + 1, len(tensors_columns)))
+        for j, tensor in enumerate(tensors):
+            ax = axs[j, i]
+            print("    Processing tensor {}/{}.".format(j + 1, len(tensors)))
+            ax.hist(tensor, log=True, bins=bins)
+            if i == 0 and row_names[j]:
+                ax.set_ylabel(row_names[j])
+            if j == 0 and col_names[i]:
+                ax.set_xlabel(col_names[i])
+                ax.xaxis.set_label_position("top")
+    fig.savefig(filename)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Visualizes networks in ckpt, pt and nnue format."
+    )
+    parser.add_argument(
+        "models", nargs="+", help="Source model (can be .ckpt, .pt or .nnue)"
+    )
+    parser.add_argument(
+        "--dont-show", action="store_true", help="Don't show the plots."
+    )
+
+    M.ModelConfig.add_model_args(parser)
+    M.add_feature_args(parser)
+    args = parser.parse_args()
+
+    feature_name = args.features
+
+    from os.path import basename
+
+    labels = []
+    for m in args.models:
+        label = basename(m)
+        if label.startswith("nn-"):
+            label = label[3:]
+        if label.endswith(".nnue"):
+            label = label[:-5]
+        labels.append("\n".join(label.split("-")))
+
+    config = M.ModelConfig.get_model_config(args)
+    models = [
+        M.load_model(
+            m,
+            feature_name,
+            config,
+            M.QuantizationConfig(),
+        )
+        for m in args.models
+    ]
+
+    coalesced_ins = [model.input.get_export_weights() for model in models]
+    input_weights = [
+        coalesced_in[:, : config.L1].flatten().numpy() for coalesced_in in coalesced_ins
+    ]
+    input_weights_psqt = [
+        (coalesced_in[:, config.L1 :] * 600).flatten().numpy()
+        for coalesced_in in coalesced_ins
+    ]
+    plot_hists(
+        [input_weights],
+        labels,
+        [None],
+        w=10.0,
+        h=3.0,
+        num_bins=8 * 128,
+        title="Distribution of feature transformer weights among different nets",
+        filename="input_weights_hist.png",
+    )
+    plot_hists(
+        [input_weights_psqt],
+        labels,
+        [None],
+        w=10.0,
+        h=3.0,
+        num_bins=8 * 128,
+        title="Distribution of feature transformer PSQT weights among different nets (in stockfish internal units)",
+        filename="input_weights_psqt_hist.png",
+    )
+
+    layer_stacks = [model.layer_stacks for model in models]
+    layers_l1 = [[] for i in range(layer_stacks[0].count)]
+    layers_l2 = [[] for i in range(layer_stacks[0].count)]
+    layers_l3 = [[] for i in range(layer_stacks[0].count)]
+    for ls in layer_stacks:
+        for i, sublayers in enumerate(ls.get_coalesced_layer_stacks()):
+            l1, l2, l3 = sublayers
+            layers_l1[i].append(l1.weight.flatten().numpy())
+            layers_l2[i].append(l2.weight.flatten().numpy())
+            layers_l3[i].append(l3.weight.flatten().numpy())
+    col_names = ["Subnet {}".format(i) for i in range(layer_stacks[0].count)]
+    plot_hists(
+        layers_l1,
+        labels,
+        col_names,
+        w=2.0,
+        h=2.0,
+        num_bins=128,
+        title="Distribution of l1 weights among different nets and buckets",
+        filename="l1_weights_hist.png",
+    )
+    plot_hists(
+        layers_l2,
+        labels,
+        col_names,
+        w=2.0,
+        h=2.0,
+        num_bins=32,
+        title="Distribution of l2 weights among different nets and buckets",
+        filename="l2_weights_hist.png",
+    )
+    plot_hists(
+        layers_l3,
+        labels,
+        col_names,
+        w=2.0,
+        h=2.0,
+        num_bins=16,
+        title="Distribution of output weights among different nets and buckets",
+        filename="output_weights_hist.png",
+    )
+
+    if not args.dont_show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

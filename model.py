@@ -1,9 +1,13 @@
 import chess
+import math
 import ranger
 import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # 3 layer fully connected network
 L1 = 256
@@ -22,7 +26,14 @@ class NNUE(pl.LightningModule):
   def __init__(self, feature_set, lambda_=1.0):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
-    self.bn_input = nn.BatchNorm1d(num_features=L1)
+    weights = self.input.weight.clone()
+    kMaxActiveDimensions = 32
+    kSigma = 0.1 / math.sqrt(kMaxActiveDimensions)
+    weights = weights.normal_(0.0, kSigma)
+    biases = self.input.bias
+    biases = biases.clone().fill_(0.5)
+    self.input.weight = nn.Parameter(weights)
+    self.input.bias = nn.Parameter(biases)
     self.feature_set = feature_set
     self.l1 = nn.Linear(2 * L1, L2)
     self.bn_l1 = nn.BatchNorm1d(num_features=L2)
@@ -31,6 +42,7 @@ class NNUE(pl.LightningModule):
     self.output = nn.Linear(L3, 1)
     self.lambda_ = lambda_
 
+    self.swa_model = AveragedModel(self)
     self._zero_virtual_feature_weights()
 
   '''
@@ -44,7 +56,7 @@ class NNUE(pl.LightningModule):
   def _zero_virtual_feature_weights(self):
     weights = self.input.weight
     for a, b in self.feature_set.get_virtual_feature_ranges():
-      weights[:, a:b] = 0.0
+      weights[a:b, :] = 0.0
     self.input.weight = nn.Parameter(weights)
 
   '''
@@ -52,6 +64,8 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
+    self.swa_model = AveragedModel(self)
+
     if self.feature_set.name == new_feature_set.name:
       return
 
@@ -105,7 +119,7 @@ class NNUE(pl.LightningModule):
     nnue2score = 600
     scaling = 361
 
-    q = self(us, them, white, black) * nnue2score / scaling
+    q = self.swa_model(us, them, white, black) * nnue2score / scaling
     t = outcome
     p = (score / scaling).sigmoid()
 
@@ -144,8 +158,13 @@ class NNUE(pl.LightningModule):
     # increasing the eps leads to less saturated nets with a few dead neurons
     optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
     # Drop learning rate after 75 epochs
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
-    return [optimizer], [scheduler]
+    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
+    #1e-3 version_0
+    swa_scheduler = SWALR(optimizer, swa_lr=1e-4)
+    return [optimizer], [swa_scheduler]
+
+  def training_epoch_end(self, outputs):
+    self.swa_model.update_parameters(self)
 
   def get_layers(self, filt):
     """

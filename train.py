@@ -1,105 +1,297 @@
-import argparse
-import model as M
-import nnue_dataset
-import nnue_bin_dataset
-import pytorch_lightning as pl
-import features
+import time
+import warnings
 import os
+import sys
+from datetime import timedelta
+
+import lightning as L
 import torch
 from torch import set_num_threads as t_set_num_threads
-from pytorch_lightning import loggers as pl_loggers
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from lightning.pytorch import loggers as pl_loggers
+from lightning.pytorch.callbacks import TQDMProgressBar, Callback, ModelCheckpoint
 
-def data_loader_cc(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device):
-  # Epoch and validation sizes are arbitrary
-  epoch_size = 100000000
-  val_size = 1000000
-  features_name = feature_set.name
-  train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
-  val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device)
-  # num_workers has to be 0 for sparse, and 1 for dense
-  # it currently cannot work in parallel mode but it shouldn't need to
-  train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
-  val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
-  return train, val
+import data_loader
+import model as M
+import tyro
 
-def data_loader_py(train_filename, val_filename, feature_set, batch_size, main_device):
-  train = DataLoader(nnue_bin_dataset.NNUEBinData(train_filename, feature_set), batch_size=batch_size, shuffle=True, num_workers=4)
-  val = DataLoader(nnue_bin_dataset.NNUEBinData(val_filename, feature_set), batch_size=32)
-  return train, val
+from config import TrainingConfig
+
+warnings.filterwarnings("ignore", ".*does not have many workers.*")
+
+
+class TimeLimitAfterCheckpoint(Callback):
+    def __init__(self, max_time: str):
+        parts = list(map(int, max_time.strip().split(":")))
+        if len(parts) != 4:
+            raise ValueError("max_time must be in format 'DD:HH:MM:SS'")
+        days, hours, minutes, seconds = parts
+        self.max_duration = timedelta(
+            days=days, hours=hours, minutes=minutes, seconds=seconds
+        ).total_seconds()
+        self.start_time = None
+
+    def on_fit_start(self, trainer, pl_module):
+        self.start_time = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        elapsed = time.time() - self.start_time
+        if elapsed >= self.max_duration:
+            trainer.should_stop = True
+            print(
+                f"[TimeLimit] Time limit reached ({elapsed:.1f}s), stopping after checkpoint."
+            )
+
+
+def make_data_loaders(
+    train_filenames,
+    val_filenames,
+    feature_name: str,
+    num_workers,
+    batch_size,
+    config: data_loader.DataloaderSkipConfig,
+    epoch_size,
+    val_size,
+    pin_memory,
+    queue_size_limit,
+):
+    # Epoch and validation sizes are arbitrary
+    features_name = feature_name
+    train_infinite = data_loader.SparseBatchDataset(
+        features_name,
+        train_filenames,
+        batch_size,
+        num_workers=num_workers,
+        config=config,
+    )
+    val_infinite = data_loader.SparseBatchDataset(
+        features_name,
+        val_filenames,
+        batch_size,
+        config=config,
+    )
+    # num_workers has to be 0 for sparse, and 1 for dense
+    # it currently cannot work in parallel mode but it shouldn't need to
+    train = DataLoader(
+        data_loader.FixedNumBatchesDataset(
+            train_infinite, (epoch_size + batch_size - 1) // batch_size,
+            pin_memory=pin_memory,
+            queue_size_limit=queue_size_limit,
+        ),
+        batch_size=None,
+        batch_sampler=None,
+        num_workers=0,
+    )
+    val = (
+        None
+        if val_size == 0
+        else DataLoader(
+            data_loader.FixedNumBatchesDataset(
+                val_infinite, (val_size + batch_size - 1) // batch_size,
+                pin_memory=pin_memory,
+                queue_size_limit=queue_size_limit,
+            ),
+            batch_size=None,
+            batch_sampler=None,
+            num_workers=0,
+        )
+    )
+    return train, val
+
 
 def main():
-  parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin or .binpack)")
-  parser.add_argument("val", help="Validation data (.bin or .binpack)")
-  parser = pl.Trainer.add_argparse_args(parser)
-  parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
-  parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
-  parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
-  parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
-  parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
-  parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
-  parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping', help="If enabled positions that are bad training targets will be skipped during loading. Default: False")
-  parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
-  parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
-  features.add_argparse_args(parser)
-  args = parser.parse_args()
+    args = tyro.cli(TrainingConfig)
+    actual_threads, actual_workers = args.threads, args.num_workers
 
-  if not os.path.exists(args.train):
-    raise Exception('{0} does not exist'.format(args.train))
-  if not os.path.exists(args.val):
-    raise Exception('{0} does not exist'.format(args.val))
+    for dataset in args.datasets:
+        if not os.path.exists(dataset):
+            raise Exception("{0} does not exist".format(dataset))
 
-  feature_set = features.get_feature_set_from_name(args.features)
+    for val_dataset in args.validation_datasets:
+        if not os.path.exists(val_dataset):
+            raise Exception("{0} does not exist".format(val_dataset))
 
-  if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_)
-  else:
-    nnue = torch.load(args.resume_from_model)
-    nnue.set_feature_set(feature_set)
-    nnue.lambda_ = args.lambda_
+    train_datasets = args.datasets
+    val_datasets = train_datasets
 
-  print("Feature set: {}".format(feature_set.name))
-  print("Num real features: {}".format(feature_set.num_real_features))
-  print("Num virtual features: {}".format(feature_set.num_virtual_features))
-  print("Num features: {}".format(feature_set.num_features))
+    if len(args.validation_datasets) > 0:
+        val_datasets = args.validation_datasets
 
-  print("Training with {} validating with {}".format(args.train, args.val))
+    if (args.loss_config.start_lambda is not None) != (args.loss_config.end_lambda is not None):
+        raise Exception(
+            "Either both or none of start_lambda and end_lambda must be specified."
+        )
 
-  pl.seed_everything(args.seed)
-  print("Seed {}".format(args.seed))
+    loss_params = args.loss_config
 
-  batch_size = args.batch_size
-  if batch_size <= 0:
-    batch_size = 128 if args.gpus == 0 else 8192
-  print('Using batch size {}'.format(batch_size))
+    loss_params.start_lambda = (
+        loss_params.start_lambda
+        if loss_params.start_lambda is not None
+        else loss_params.lambda_
+    )
+    loss_params.end_lambda = (
+        loss_params.end_lambda
+        if loss_params.end_lambda is not None
+        else loss_params.lambda_
+    )
 
-  print('Smart fen skipping: {}'.format(args.smart_fen_skipping))
-  print('Random fen skipping: {}'.format(args.random_fen_skipping))
+    global_batch_size_requested = args.batch_size
+    if global_batch_size_requested <= 0:
+        global_batch_size_requested = 16384
+    # temporarily default to using only device 0 if user didn't specify --gpus
+    # doing this so that batch size is consistent since if we rely on "auto" behavior
+    # we don't know at this point in the code what the world size is.
+    # TODO: refactor initialization so that we can support default behavior of "auto" with proper batch sizing
+    if args.gpus:
+        try:
+            devices = [int(x) for x in args.gpus.rstrip(",").split(",") if x]
+        except ValueError:
+            print(
+                f"Invalid --gpus argument: '{args.gpus}'. "
+                "Expected a comma separated list of ints, e.g. 0,1",
+                file=sys.stderr,
+            )
+            return
+    else:
+        devices = [0]
+    n_devices = len(devices)
+    if n_devices == 0:
+        print(
+            f"Invalid --gpus argument: '{args.gpus}'. "
+            "Expected a comma separated list of ints, e.g. 0,1",
+            file=sys.stderr,
+        )
+        return
+    if global_batch_size_requested % n_devices != 0:
+        raise ValueError(
+            f"--batch-size {global_batch_size_requested} must be divisible by number of gpus ({n_devices}). "
+            f"Got --gpus={args.gpus or '0'}"
+        )
+    per_gpu_batch_size = global_batch_size_requested // n_devices
+    print(
+        f"batch_size(global)={global_batch_size_requested} | n_devices={n_devices} | batch_size(per_gpu)={per_gpu_batch_size}",
+        flush=True,
+    )
 
-  if args.threads > 0:
-    print('limiting torch to {} threads.'.format(args.threads))
-    t_set_num_threads(args.threads)
+    feature_name = args.features
 
-  logdir = args.default_root_dir if args.default_root_dir else 'logs/'
-  print('Using log dir {}'.format(logdir), flush=True)
+    print("Loss parameters:")
+    print(loss_params)
 
-  tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+    num_batches_per_epoch=max(
+                1, args.epoch_size // global_batch_size_requested
+            )
 
-  main_device = trainer.root_device if trainer.root_gpu is None else 'cuda:' + str(trainer.root_gpu)
+    max_epoch = args.max_epochs or 800
+    if args.resume_from_model is None:
+        nnue = M.NNUE(
+            feature_name=feature_name,
+            loss_params=loss_params,
+            max_epoch=max_epoch,
+            num_batches_per_epoch=num_batches_per_epoch,
+            gamma=args.gamma,
+            lr=args.lr,
+            param_index=args.dataloader_config.param_index,
+            config=args.model_config,
+            quantize_config=M.QuantizationConfig(),
+        )
+    else:
+        assert os.path.exists(args.resume_from_model)
+        try:
+            nnue = torch.load(args.resume_from_model, weights_only=False, map_location="cpu")
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                f"Could not load checkpoint: {e}. The model to be resumed was probably saved with a different version of the code."
+            )
+        nnue.loss_params = loss_params
+        nnue.max_epoch = max_epoch
+        nnue.num_batches_per_epoch = num_batches_per_epoch
+        # we can set the following here just like that because when resuming
+        # from .pt the optimizer is only created after the training is started
+        nnue.gamma = args.gamma
+        nnue.lr = args.lr
+        nnue.compile_backend = args.compile_backend
+        nnue.param_index = args.dataloader_config.param_index
 
-  if args.py_data:
-    print('Using python data loader')
-    train, val = data_loader_py(args.train, args.val, feature_set, batch_size, main_device)
-  else:
-    print('Using c++ data loader')
-    train, val = data_loader_cc(args.train, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device)
+    input_feature_name = nnue.model.input_feature_name
+    print("Feature set: {}".format(feature_name))
+    print("Num inputs: {}".format(nnue.model.input.NUM_INPUTS))
 
-  trainer.fit(nnue, train, val)
+    print("Training with: {}".format(train_datasets))
+    print("Validating with: {}".format(val_datasets))
 
-if __name__ == '__main__':
-  main()
+    L.seed_everything(args.seed)
+    print("Seed {}".format(args.seed))
+
+    print(args.dataloader_config)
+
+    logdir = args.default_root_dir if args.default_root_dir else "logs/"
+
+    tb_logger = pl_loggers.TensorBoardLogger(logdir)
+
+    print("Using log dir {}".format(tb_logger.log_dir), flush=True)
+
+    checkpoint_callback = ModelCheckpoint(
+        save_last=args.save_last_network,
+        every_n_epochs=args.network_save_period,
+        save_top_k=-1,
+    )
+
+    nnue = torch.compile(nnue, backend=args.compile_backend)
+    # PL hack, undo slurm cluster detection which is broken for us. 'force interactive mode'
+    # see lightning/fabric/plugins/environments/slurm.py near line 110
+    os.environ["SLURM_JOB_NAME"] = "bash"
+
+    refresh_rate = max(1, (nnue.num_batches_per_epoch + 4) // 5)
+    trainer = L.Trainer(
+        default_root_dir=logdir,
+        max_epochs=args.max_epochs,
+        accelerator="cuda",
+        strategy="ddp" if len(devices) > 1 else "auto",
+        devices=devices,
+        logger=tb_logger,
+        callbacks=[
+            checkpoint_callback,
+            TQDMProgressBar(refresh_rate=refresh_rate),
+            TimeLimitAfterCheckpoint(args.max_time),
+            M.WeightClippingCallback(),
+        ],
+        enable_progress_bar=True,
+        enable_checkpointing=True,
+        benchmark=True,
+        num_sanity_val_steps=0,
+    )
+
+    if actual_threads > 0:
+        print("Set torch num_threads to {} threads.".format(actual_threads))
+        t_set_num_threads(actual_threads)
+    else:
+        print("Using default torch num_threads setting.", flush=True)
+    print(f"Using {actual_workers} workers for C++ data loader.", flush=True)
+    train, val = make_data_loaders(
+        train_datasets,
+        val_datasets,
+        input_feature_name,
+        actual_workers,
+        per_gpu_batch_size,
+        args.dataloader_config,
+        args.epoch_size,
+        args.validation_size,
+        pin_memory=args.pin_memory,
+        queue_size_limit=args.data_loader_queue_size,
+    )
+
+    if args.resume_from_checkpoint:
+        trainer.fit(nnue, train, val, ckpt_path=args.resume_from_checkpoint)
+    else:
+        trainer.fit(nnue, train, val)
+
+    if trainer.is_global_zero:
+        with open(os.path.join(logdir, "training_finished"), "w"):
+            pass
+
+
+if __name__ == "__main__":
+    main()
+    if sys.platform == "win32":
+        os._exit(0)
