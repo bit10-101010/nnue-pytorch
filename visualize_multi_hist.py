@@ -40,7 +40,11 @@ def load_model(filename, feature_set):
         # which internally uses pickle and can execute arbitrary code.
         safe_filename = is_safe_model_path(filename)
         if safe_filename.endswith(".pt"):
-            model = torch.load(safe_filename)
+            # Load only the tensor weights into a freshly constructed model
+            # rather than deserializing an arbitrary object graph.
+            state_dict = torch.load(safe_filename, map_location='cpu', weights_only=True)
+            model = M.NNUE(feature_set=feature_set)
+            model.load_state_dict(state_dict)
         else:
             model = M.NNUE.load_from_checkpoint(
                 safe_filename, feature_set=feature_set)
