@@ -36,7 +36,9 @@ class NNUE(pl.LightningModule):
     self.input.bias = nn.Parameter(biases)
     self.feature_set = feature_set
     self.l1 = nn.Linear(2 * L1, L2)
+    self.bn_l1 = nn.BatchNorm1d(num_features=L2)
     self.l2 = nn.Linear(L2, L3)
+    self.bn_l2 = nn.BatchNorm1d(num_features=L3)
     self.output = nn.Linear(L3, 1)
     self.lambda_ = lambda_
 
@@ -99,13 +101,13 @@ class NNUE(pl.LightningModule):
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
   def forward(self, us, them, w_in, b_in):
-    w = self.input(w_in)
-    b = self.input(b_in)
+    w = self.bn_input(self.input(w_in))
+    b = self.bn_input(self.input(b_in))
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
     # clamp here is used as a clipped relu to (0.0, 1.0)
     l0_ = torch.clamp(l0_, 0.0, 1.0)
-    l1_ = torch.clamp(self.l1(l0_), 0.0, 1.0)
-    l2_ = torch.clamp(self.l2(l1_), 0.0, 1.0)
+    l1_ = torch.clamp(self.bn_l1(self.l1(l0_)), 0.0, 1.0)
+    l2_ = torch.clamp(self.bn_l2(self.l2(l1_)), 0.0, 1.0)
     x = self.output(l2_)
     return x
 
@@ -171,7 +173,5 @@ class NNUE(pl.LightningModule):
     """
     for i in self.children():
       if filt(i):
-        if isinstance(i, nn.Linear):
-          for p in i.parameters():
-            if p.requires_grad:
-              yield p
+        for p in i.parameters():
+          yield p

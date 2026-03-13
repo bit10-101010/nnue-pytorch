@@ -14,6 +14,27 @@ from torch.utils.data import DataLoader
 from functools import reduce
 import operator
 
+def fuse_bn(linear, bn):
+  w = linear.weight
+  mean = bn.running_mean
+  var_sqrt = torch.sqrt(bn.running_var + bn.eps)
+  beta = bn.weight
+  gamma = bn.bias
+  b = linear.bias
+  w = w * (beta / var_sqrt).reshape([linear.out_features, 1])
+  b = (b - mean) / var_sqrt * beta + gamma
+
+  fused_linear = torch.nn.Linear(linear.in_features, linear.out_features)
+  fused_linear.weight = torch.nn.Parameter(w)
+  fused_linear.bias = torch.nn.Parameter(b)
+  return fused_linear
+
+def fuse_bn_model(model):
+  model.input = fuse_bn(model.input, model.bn_input)
+  model.l1 = fuse_bn(model.l1, model.bn_l1)
+  model.l2 = fuse_bn(model.l2, model.bn_l2)
+  return model
+
 def ascii_hist(name, x, bins=6):
   N,X = numpy.histogram(x, bins=bins)
   total = 1.0*len(x)
@@ -36,6 +57,7 @@ class NNUEWriter():
   """
   def __init__(self, model):
     self.buf = bytearray()
+    model = fuse_bn_model(model)
 
     self.write_header(model)
     self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
