@@ -5,10 +5,17 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
+from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 # 3 layer fully connected network
 L1 = 256
 L2 = 32
 L3 = 32
+
+POLICY_L1 = 256
+POLICY_L2 = 256
+POLICY = 64 * 64 # one-hot -> from x to (ignores underpromotions)
 
 class NNUE(pl.LightningModule):
   """
@@ -16,18 +23,32 @@ class NNUE(pl.LightningModule):
 
   lambda_ = 0.0 - purely based on game results
   lambda_ = 1.0 - purely based on search scores
-
-  It is not ideal for training a Pytorch quantized model directly.
   """
   def __init__(self, feature_set, lambda_=1.0):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
+    weights = self.input.weight.clone()
+    kMaxActiveDimensions = 32
+    kSigma = 0.1 / math.sqrt(kMaxActiveDimensions)
+    weights = weights.normal_(0.0, kSigma)
+    biases = self.input.bias
+    biases = biases.clone().fill_(0.5)
+    self.input.weight = nn.Parameter(weights)
+    self.input.bias = nn.Parameter(biases)
     self.feature_set = feature_set
     self.l1 = nn.Linear(2 * L1, L2)
+    self.bn_l1 = nn.BatchNorm1d(num_features=L2)
     self.l2 = nn.Linear(L2, L3)
+    self.bn_l2 = nn.BatchNorm1d(num_features=L3)
     self.output = nn.Linear(L3, 1)
+
+    self.policy_l1 = nn.Linear(2 * L1, POLICY_L1)
+    self.policy_l2 = nn.Linear(POLICY_L1, POLICY_L2)
+    self.policy = nn.Linear(POLICY_L2, POLICY)
+
     self.lambda_ = lambda_
 
+    self.swa_model = AveragedModel(self)
     self._zero_virtual_feature_weights()
 
   '''
@@ -41,7 +62,7 @@ class NNUE(pl.LightningModule):
   def _zero_virtual_feature_weights(self):
     weights = self.input.weight
     for a, b in self.feature_set.get_virtual_feature_ranges():
-      weights[:, a:b] = 0.0
+      weights[a:b, :] = 0.0
     self.input.weight = nn.Parameter(weights)
 
   '''
@@ -49,6 +70,8 @@ class NNUE(pl.LightningModule):
   to new_feature_set.
   '''
   def set_feature_set(self, new_feature_set):
+    self.swa_model = AveragedModel(self)
+
     if self.feature_set.name == new_feature_set.name:
       return
 
@@ -84,35 +107,56 @@ class NNUE(pl.LightningModule):
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
   def forward(self, us, them, w_in, b_in):
+    return self.quant_forward(us, them, w_in, b_in)
+
     w = self.input(w_in)
     b = self.input(b_in)
     l0_ = (us * torch.cat([w, b], dim=1)) + (them * torch.cat([b, w], dim=1))
     # clamp here is used as a clipped relu to (0.0, 1.0)
-    l0_ = torch.clamp(l0_, 0.0, 1.0)
-    l1_ = torch.clamp(self.l1(l0_), 0.0, 1.0)
+    l0_clamp = torch.clamp(l0_, 0.0, 1.0)
+    l1_ = torch.clamp(self.l1(l0_clamp), 0.0, 1.0)
     l2_ = torch.clamp(self.l2(l1_), 0.0, 1.0)
     x = self.output(l2_)
-    return x
+    # Policy head
+    p_l1 = F.relu(self.policy_l1(F.relu(l0_)))
+    p_l2 = F.relu(self.policy_l2(p_l1))
+    policy_ = self.policy(p_l2)
+
+    return x, policy_
 
   def step_(self, batch, batch_idx, loss_type):
-    us, them, white, black, outcome, score = batch
+    us, them, white, black, outcome, score, move = batch
+    us, them, white, black, outcome, score, ply = batch
 
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
     # This needs to match the value used in the serializer
     nnue2score = 600
     scaling = 361
 
-    q = self(us, them, white, black) * nnue2score / scaling
+    q, moves = self(us, them, white, black)
+    q = q * nnue2score / scaling
     t = outcome
+    q = self(us, them, white, black) * nnue2score / scaling
+    # Normalize ply to [0,1].
+    ply = torch.clamp((ply - 40) / 100.0, 0.0, 1.0)
     p = (score / scaling).sigmoid()
+    # Interpolate from eval at ply = 0, to game score at ply = 1.
+    p = (1.0 - ply) * p + ply * outcome
 
     epsilon = 1e-12
     teacher_entropy = -(p * (p + epsilon).log() + (1.0 - p) * (1.0 - p + epsilon).log())
-    outcome_entropy = -(t * (t + epsilon).log() + (1.0 - t) * (1.0 - t + epsilon).log())
     teacher_loss = -(p * F.logsigmoid(q) + (1.0 - p) * F.logsigmoid(-q))
     outcome_loss = -(t * F.logsigmoid(q) + (1.0 - t) * F.logsigmoid(-q))
     result  = self.lambda_ * teacher_loss    + (1.0 - self.lambda_) * outcome_loss
     entropy = self.lambda_ * teacher_entropy + (1.0 - self.lambda_) * outcome_entropy
+    value_loss = result.mean() - entropy.mean()
+
+    policy_loss = F.cross_entropy(moves, move.long()) / 50
+    self.log(loss_type + '_value_loss', value_loss)
+    self.log(loss_type + '_policy_loss', policy_loss)
+    return value_loss + policy_loss
+    result  = self.lambda_ * teacher_loss
+    entropy = self.lambda_ * teacher_entropy
     loss = result.mean() - entropy.mean()
     self.log(loss_type, loss)
     return loss
@@ -123,13 +167,13 @@ class NNUE(pl.LightningModule):
     # loss = F.mse_loss(output, score)
 
   def training_step(self, batch, batch_idx):
-    return self.step_(batch, batch_idx, 'train_loss')
+    return self.step_(batch, batch_idx, 'train')
 
   def validation_step(self, batch, batch_idx):
-    self.step_(batch, batch_idx, 'val_loss')
+    self.step_(batch, batch_idx, 'val')
 
   def test_step(self, batch, batch_idx):
-    self.step_(batch, batch_idx, 'test_loss')
+    self.step_(batch, batch_idx, 'test')
 
   def configure_optimizers(self):
     # Train with a lower LR on the output layer
@@ -141,7 +185,7 @@ class NNUE(pl.LightningModule):
     # increasing the eps leads to less saturated nets with a few dead neurons
     optimizer = ranger_ada.RangerAdaBelief(self.parameters(), betas=(.9, 0.999), eps=1.0e-7)
     # Drop learning rate after 75 epochs
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=75, gamma=0.3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=125, gamma=0.25)
     return [optimizer], [scheduler]
 
   def get_layers(self, filt):
@@ -151,7 +195,5 @@ class NNUE(pl.LightningModule):
     """
     for i in self.children():
       if filt(i):
-        if isinstance(i, nn.Linear):
-          for p in i.parameters():
-            if p.requires_grad:
-              yield p
+        for p in i.parameters():
+          yield p
