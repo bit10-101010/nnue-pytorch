@@ -1,6 +1,9 @@
 import argparse
-import features
-import math
+import hashlib
+import os
+
+import torch
+
 import model as M
 import numpy
 import nnue_bin_dataset
@@ -158,15 +161,75 @@ class NNUEReader():
     return v
 
 def main():
-  parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
-  parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
-  parser.add_argument("target", help="Target file (can be .pt or .nnue)")
-  features.add_argparse_args(parser)
-  args = parser.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Converts files between ckpt and nnue format."
+    )
+    parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
+    parser.add_argument("target", help="Target file (can be .pt or .nnue)")
+    parser.add_argument(
+        "--out-sha",
+        action="store_true",
+        dest="out_sha",
+        help="Ignore target file name and save as nn-<sha>.nnue. If target is a directory, the file is placed there; otherwise it goes to dirname(target) or CWD.",
+    )
+    parser.add_argument(
+        "--description",
+        default=None,
+        type=str,
+        dest="description",
+        help="The description string to include in the network. Only works when serializing into a .nnue file.",
+    )
+    parser.add_argument(
+        "--ft_compression",
+        default="leb128",
+        type=str,
+        dest="ft_compression",
+        help="Compression method to use for FT weights and biases. Either 'none' or 'leb128'. Only allowed if saving to .nnue.",
+    )
+    parser.add_argument(
+        "--ft_perm",
+        default=None,
+        type=str,
+        dest="ft_perm",
+        help="Path to a file that defines the permutation to use on the feature transformer.",
+    )
+    parser.add_argument(
+        "--ft_optimize",
+        action="store_true",
+        dest="ft_optimize",
+        help="Whether to perform full feature transformer optimization (ftperm.py) on the resulting network. This process is very time consuming.",
+    )
+    parser.add_argument(
+        "--ft_optimize_data",
+        default=None,
+        type=str,
+        dest="ft_optimize_data",
+        help="Path to the dataset to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--ft_optimize_count",
+        default=10000,
+        type=int,
+        dest="ft_optimize_count",
+        help="Number of positions to use for FT optimization.",
+    )
+    parser.add_argument(
+        "--no-cupy",
+        action="store_false",
+        dest="use_cupy",
+        help="Disable CUPY usage if not enough GPU memory is available. This will use numpy instead, which is slower.",
+    )
+    parser.add_argument(
+        "--device", type=int, default="0", help="Device to use for cupy"
+    )
 
-  feature_set = features.get_feature_set_from_name(args.features)
+    M.ModelConfig.add_model_args(parser)
+    M.add_feature_args(parser)
+    args = parser.parse_args()
 
-  print('Converting %s to %s' % (args.source, args.target))
+    feature_name = args.features
+
+    print("Converting %s to %s" % (args.source, args.target))
 
   if args.source.endswith(".pt") or args.source.endswith(".ckpt"):
     if args.source.endswith(".pt"):
@@ -191,5 +254,5 @@ def main():
   else:
     raise Exception('Invalid filetypes: ' + str(args))
 
-if __name__ == '__main__':
-  main()
+if __name__ == "__main__":
+    main()
