@@ -60,6 +60,37 @@ Automatically converts all `.ckpt` found under `run96` to `.nnue` and runs games
 This script runs in a loop, and will monitor the directory for new checkpoints. Can be run in parallel with the training, if idle cores are available.
 
 <!--SYNC-START-->
+## 🔎 Upstream Sync Dashboard
+
+**Repository:** thollander/actions-comment-pull-request
+
+![Ahead](https://img.shields.io/badge/Ahead-619-green)
+![Behind](https://img.shields.io/badge/Behind-188-red)
+![Sync](https://img.shields.io/badge/Sync-76%25-blue)
+
+### Status
+🟢 **619 commit(s) ahead**  
+🔴 **188 commit(s) behind**
+
+### Sync Progress
+[███████████████░░░░░] **76%**
+
+### Details
+
+| Metric | Value |
+|------|------|
+| Ahead commits | 619 |
+| Behind commits | 188 |
+| Total difference | 807 |
+
+### Controls
+
+🔄 **Auto-updates every hour**  
+⚡ **Manual refresh:** Run this workflow in the Actions tab
+
+### Last Updated
+
+Mon Mar 16 20:02:38 UTC 2026
 <!--SYNC-END-->
 
 * https://hxim.github.io/Stockfish-Evaluation-Guide/
