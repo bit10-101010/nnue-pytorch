@@ -21,7 +21,7 @@ jobs:
 
       - name: Add upstream
         run: |
-          git remote add upstream https://github.com/thollander/actions-comment-pull-request.git || true
+          git remote add upstream https://github.com/official-stockfish/nnue-pytorch.git || true
           git fetch upstream
 
       - name: Compare commits
@@ -57,7 +57,7 @@ jobs:
           cat <<EOF > status.md
           ## 🔎 Upstream Sync Dashboard
 
-          **Repository:** thollander/actions-comment-pull-request
+          **Repository:** official-stockfish/nnue-pytorch
 
           ![Ahead](https://img.shields.io/badge/Ahead-${AHEAD}-green)
           ![Behind](https://img.shields.io/badge/Behind-${BEHIND}-red)
