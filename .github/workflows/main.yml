@@ -1,0 +1,109 @@
+name: Upstream Sync Dashboard
+
+on:
+  workflow_dispatch:
+  push:
+  schedule:
+    - cron: "0 * * * *"
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/thollander/actions-comment-pull-request.git || true
+          git fetch upstream
+
+      - name: Compare commits
+        id: compare
+        run: |
+          AHEAD=$(git rev-list --count upstream/main..HEAD)
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+
+          echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+
+      - name: Generate dashboard
+        run: |
+          AHEAD=${{ steps.compare.outputs.ahead }}
+          BEHIND=${{ steps.compare.outputs.behind }}
+
+          TOTAL=$((AHEAD + BEHIND))
+
+          if [ "$TOTAL" -eq 0 ]; then
+            PERCENT=100
+          else
+            PERCENT=$((AHEAD * 100 / TOTAL))
+          fi
+
+          FILLED=$((PERCENT / 5))
+          EMPTY=$((20 - FILLED))
+
+          BAR=$(printf "%0.s█" $(seq 1 $FILLED))
+          SPACE=$(printf "%0.s░" $(seq 1 $EMPTY))
+
+          DATE=$(date -u)
+
+          cat <<EOF > status.md
+          ## 🔎 Upstream Sync Dashboard
+
+          **Repository:** thollander/actions-comment-pull-request
+
+          ![Ahead](https://img.shields.io/badge/Ahead-${AHEAD}-green)
+          ![Behind](https://img.shields.io/badge/Behind-${BEHIND}-red)
+          ![Sync](https://img.shields.io/badge/Sync-${PERCENT}%25-blue)
+
+          ### Status
+          🟢 **$AHEAD commit(s) ahead**  
+          🔴 **$BEHIND commit(s) behind**
+
+          ### Sync Progress
+          [$BAR$SPACE] **$PERCENT%**
+
+          ### Details
+
+          | Metric | Value |
+          |------|------|
+          | Ahead commits | $AHEAD |
+          | Behind commits | $BEHIND |
+          | Total difference | $TOTAL |
+
+          ### Controls
+
+          🔄 **Auto-updates every hour**  
+          ⚡ **Manual refresh:** Run this workflow in the Actions tab
+
+          ### Last Updated
+
+          $DATE
+          EOF
+
+      - name: Inject dashboard into README
+        run: |
+          if grep -q "<!--SYNC-START-->" README.md; then
+            awk '/<!--SYNC-START-->/{print;system("cat status.md");skip=1;next}/<!--SYNC-END-->/{skip=0} !skip' README.md > tmp.md
+            mv tmp.md README.md
+          else
+            echo "<!--SYNC-START-->" >> README.md
+            cat status.md >> README.md
+            echo "<!--SYNC-END-->" >> README.md
+          fi
+
+      - name: Commit changes
+        run: |
+          git config user.name github-actions
+          git config user.email actions@github.com
+          git add README.md
+          git commit -m "update upstream dashboard" || true
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
