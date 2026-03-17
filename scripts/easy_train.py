@@ -2679,9 +2679,7 @@ def main():
 
     # Local (experiment) setup
 
-    experiment_directory = os.path.join(
-        absolute_workspace_path, f"experiments/experiment_{args.experiment_name}"
-    )
+    experiment_directory = Path(absolute_workspace_path) / "experiments" / f"experiment_{args.experiment_name}"
     try:
         os.makedirs(experiment_directory, exist_ok=False)
     except FileExistsError:
@@ -2694,11 +2692,11 @@ def main():
             )
             return
 
-    stockfish_base_directory = os.path.join(experiment_directory, "stockfish_base")
-    stockfish_test_directory = os.path.join(experiment_directory, "stockfish_test")
-    nnue_pytorch_directory = os.path.join(experiment_directory, "nnue-pytorch")
-    logging_directory = os.path.join(experiment_directory, "logging")
-    start_model_directory = os.path.join(experiment_directory, "start_models")
+    stockfish_base_directory = experiment_directory / "stockfish_base"
+    stockfish_test_directory = experiment_directory / "stockfish_test"
+    nnue_pytorch_directory = experiment_directory / "nnue-pytorch"
+    logging_directory = experiment_directory / "logging"
+    start_model_directory = experiment_directory / "start_models"
 
     log_args(logging_directory, args)
 
@@ -2752,7 +2750,7 @@ def main():
     start_model = None
     if args.start_from_engine_test_net:
         args.start_from_model = str(
-            next(Path(os.path.join(stockfish_test_directory, "src/")).rglob("*.nnue"))
+            next((stockfish_test_directory / "src").rglob("*.nnue"))
         )
 
     if args.start_from_model:
