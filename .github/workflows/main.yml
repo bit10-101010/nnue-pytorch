@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -27,8 +27,11 @@ jobs:
       - name: Compare commits
         id: compare
         run: |
-          AHEAD=$(git rev-list --count upstream/main..HEAD)
-          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          UPSTREAM_DEFAULT_BRANCH=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
+          UPSTREAM_DEFAULT_REF="upstream/${UPSTREAM_DEFAULT_BRANCH}"
+
+          AHEAD=$(git rev-list --count "${UPSTREAM_DEFAULT_REF}"..HEAD)
+          BEHIND=$(git rev-list --count HEAD.."${UPSTREAM_DEFAULT_REF}")
 
           echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
           echo "behind=$BEHIND" >> $GITHUB_OUTPUT
