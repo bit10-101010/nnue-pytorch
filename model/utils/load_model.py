@@ -13,7 +13,7 @@ def load_model(
     quantize_config: QuantizationConfig,
 ) -> NNUEModel:
     if filename.endswith(".pt"):
-        model = torch.load(filename, weights_only=False)
+        model = torch.load(filename, weights_only=True)
         model.eval()
         return model.model
 
