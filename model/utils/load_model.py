@@ -13,7 +13,13 @@ def load_model(
     quantize_config: QuantizationConfig,
 ) -> NNUEModel:
     if filename.endswith(".pt"):
-        model = torch.load(filename, weights_only=True)
+        # Load PyTorch checkpoint on CPU to avoid executing device-specific
+        # deserialization logic and ensure a consistent environment.
+        model = torch.load(filename, map_location="cpu", weights_only=True)
+        # Basic sanity check: we expect the checkpoint to contain an object
+        # with a `.model` attribute that can be put into eval mode.
+        if not hasattr(model, "model"):
+            raise ValueError(f"Unexpected checkpoint format for file: {filename}")
         model.eval()
         return model.model
 
