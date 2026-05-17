@@ -64,12 +64,12 @@ This script runs in a loop, and will monitor the directory for new checkpoints. 
 
 **Repository:** official-stockfish/nnue-pytorch
 
-![Ahead](https://img.shields.io/badge/Ahead-759-green)
+![Ahead](https://img.shields.io/badge/Ahead-760-green)
 ![Behind](https://img.shields.io/badge/Behind-32-red)
 ![Sync](https://img.shields.io/badge/Sync-95%25-blue)
 
 ### Status
-🟢 **759 commit(s) ahead**  
+🟢 **760 commit(s) ahead**  
 🔴 **32 commit(s) behind**
 
 ### Sync Progress
@@ -79,9 +79,9 @@ This script runs in a loop, and will monitor the directory for new checkpoints. 
 
 | Metric | Value |
 |------|------|
-| Ahead commits | 759 |
+| Ahead commits | 760 |
 | Behind commits | 32 |
-| Total difference | 791 |
+| Total difference | 792 |
 
 ### Controls
 
@@ -90,7 +90,7 @@ This script runs in a loop, and will monitor the directory for new checkpoints. 
 
 ### Last Updated
 
-Sun May 17 19:00:44 UTC 2026
+Sun May 17 20:42:12 UTC 2026
 <!--SYNC-END-->
 
 * https://hxim.github.io/Stockfish-Evaluation-Guide/
